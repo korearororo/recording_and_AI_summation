@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: recording-ai-backend
+    runtime: docker
+    plan: free
+    region: singapore
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "*"
+      - key: TRANSCRIBE_MODEL
+        value: "gpt-4o-transcribe"
+      - key: SUMMARY_MODEL
+        value: "gpt-4.1-mini"
+      - key: CHAT_TRANSCRIBE_MODEL
+        value: "gpt-4.1-mini"
+      - key: CHAT_SUMMARY_MODEL
+        value: "gpt-4.1-mini"
+      - key: TRANSCRIBE_MAX_FILE_MB
+        value: "24"
+      - key: TRANSCRIBE_CHUNK_MINUTES
+        value: "10"
+      - key: TRANSCRIBE_CHUNK_BITRATE
+        value: "64k"

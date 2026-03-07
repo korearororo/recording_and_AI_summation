@@ -1,0 +1,14 @@
+﻿# Ignore Python artifacts
+__pycache__/
+*.pyc
+backend/.venv/
+backend/.env
+
+# Ignore Node artifacts
+mobile-app/node_modules/
+mobile-app/.expo/
+mobile-app/.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
