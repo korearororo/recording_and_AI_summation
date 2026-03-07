@@ -2,6 +2,7 @@
 
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +37,11 @@ class OpenAIService:
     def __init__(self) -> None:
         settings = get_settings()
         self.settings = settings
-        self.client = OpenAI(api_key=settings.openai_api_key)
+        self.client = OpenAI(
+            api_key=settings.openai_api_key,
+            timeout=settings.openai_timeout_seconds,
+            max_retries=settings.openai_max_retries,
+        )
 
     def transcribe_file(self, file_path: str) -> str:
         source_path = Path(file_path)
@@ -118,24 +123,44 @@ class OpenAIService:
     def _transcribe_large_file(self, source_path: Path, max_upload_bytes: int) -> str:
         with tempfile.TemporaryDirectory(prefix="audio_chunks_") as tmp_dir:
             chunk_paths = self._split_audio_with_ffmpeg(source_path, Path(tmp_dir))
-            transcripts: list[str] = []
-
-            for chunk_path in chunk_paths:
-                if chunk_path.stat().st_size > max_upload_bytes:
-                    raise RuntimeError(
-                        f"Chunk {chunk_path.name} exceeds upload limit "
-                        f"({self.settings.transcribe_max_file_mb}MB). "
-                        "Reduce TRANSCRIBE_CHUNK_MINUTES or bitrate."
-                    )
-
-                text = self._transcribe_single_file(chunk_path).strip()
-                if text:
-                    transcripts.append(text)
+            transcripts = self._transcribe_chunks_parallel(chunk_paths, max_upload_bytes)
 
             if not transcripts:
                 raise RuntimeError("Large file transcription produced no text.")
 
             return "\n".join(transcripts)
+
+    def _transcribe_chunks_parallel(self, chunk_paths: list[Path], max_upload_bytes: int) -> list[str]:
+        if not chunk_paths:
+            return []
+
+        workers = max(1, min(self.settings.transcribe_parallel_chunks, len(chunk_paths)))
+        ordered_texts: list[str] = [""] * len(chunk_paths)
+
+        if workers == 1:
+            for index, chunk_path in enumerate(chunk_paths):
+                ordered_texts[index] = self._transcribe_chunk(chunk_path, max_upload_bytes)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(self._transcribe_chunk, chunk_path, max_upload_bytes): index
+                    for index, chunk_path in enumerate(chunk_paths)
+                }
+                for future in as_completed(futures):
+                    index = futures[future]
+                    ordered_texts[index] = future.result()
+
+        return [text for text in ordered_texts if text]
+
+    def _transcribe_chunk(self, chunk_path: Path, max_upload_bytes: int) -> str:
+        if chunk_path.stat().st_size > max_upload_bytes:
+            raise RuntimeError(
+                f"Chunk {chunk_path.name} exceeds upload limit "
+                f"({self.settings.transcribe_max_file_mb}MB). "
+                "Reduce TRANSCRIBE_CHUNK_MINUTES or bitrate."
+            )
+
+        return self._transcribe_single_file(chunk_path).strip()
 
     def _split_audio_with_ffmpeg(self, source_path: Path, output_dir: Path) -> list[Path]:
         chunk_minutes = max(self.settings.transcribe_chunk_minutes, 1)

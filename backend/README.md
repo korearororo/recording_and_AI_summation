@@ -37,5 +37,8 @@ If you want to use the app from any network (not only your home/PC LAN), deploy 
   - `TRANSCRIBE_MAX_FILE_MB` (default `24`)
   - `TRANSCRIBE_CHUNK_MINUTES` (default `10`)
   - `TRANSCRIBE_CHUNK_BITRATE` (default `64k`)
+  - `TRANSCRIBE_PARALLEL_CHUNKS` (default `3`)
+  - `OPENAI_TIMEOUT_SECONDS` (default `300`)
+  - `OPENAI_MAX_RETRIES` (default `1`)
   - `CHAT_TRANSCRIBE_MODEL` (default `gpt-4.1-mini`)
   - `CHAT_SUMMARY_MODEL` (default `gpt-4.1-mini`)

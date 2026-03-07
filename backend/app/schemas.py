@@ -16,3 +16,10 @@ class SummarizeResponse(BaseModel):
 class ProcessResponse(BaseModel):
     transcript: str
     summary: str
+
+
+class LibrarySyncResponse(BaseModel):
+    subject_id: str
+    subject_name: str
+    target_dir: str
+    saved_files: list[str]

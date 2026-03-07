@@ -13,7 +13,7 @@ services:
       - key: ALLOWED_ORIGINS
         value: "*"
       - key: TRANSCRIBE_MODEL
-        value: "gpt-4o-transcribe"
+        value: "gpt-4o-mini-transcribe"
       - key: SUMMARY_MODEL
         value: "gpt-4.1-mini"
       - key: CHAT_TRANSCRIBE_MODEL
@@ -26,3 +26,9 @@ services:
         value: "10"
       - key: TRANSCRIBE_CHUNK_BITRATE
         value: "64k"
+      - key: TRANSCRIBE_PARALLEL_CHUNKS
+        value: "3"
+      - key: OPENAI_TIMEOUT_SECONDS
+        value: "300"
+      - key: OPENAI_MAX_RETRIES
+        value: "1"
