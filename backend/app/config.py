@@ -23,6 +23,14 @@ class Settings(BaseSettings):
     library_root: str = Field(default="library", alias="LIBRARY_ROOT")
     auth_db_path: str = Field(default="auth/auth.db", alias="AUTH_DB_PATH")
     auth_session_hours: int = Field(default=24 * 30, alias="AUTH_SESSION_HOURS")
+    auth_public_base_url: str = Field(default="", alias="AUTH_PUBLIC_BASE_URL")
+    auth_mobile_redirect_uri: str = Field(default="meetingnoteai://auth/callback", alias="AUTH_MOBILE_REDIRECT_URI")
+    google_client_id: str = Field(default="", alias="GOOGLE_CLIENT_ID")
+    google_client_secret: str = Field(default="", alias="GOOGLE_CLIENT_SECRET")
+    kakao_client_id: str = Field(default="", alias="KAKAO_CLIENT_ID")
+    kakao_client_secret: str = Field(default="", alias="KAKAO_CLIENT_SECRET")
+    naver_client_id: str = Field(default="", alias="NAVER_CLIENT_ID")
+    naver_client_secret: str = Field(default="", alias="NAVER_CLIENT_SECRET")
 
     @property
     def allowed_origins_list(self) -> List[str]:

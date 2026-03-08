@@ -9,11 +9,13 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Lock
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 
 from app.config import Settings, get_settings
 from app.schemas import (
@@ -40,6 +42,7 @@ JOB_LOCK = Lock()
 JOBS: dict[str, dict[str, object]] = {}
 AUTH_LOCK = Lock()
 AUTH_STORE: AuthStore | None = None
+SUPPORTED_OAUTH_PROVIDERS = {"google", "kakao", "naver"}
 
 
 def _configure_cors(settings: Settings) -> None:
@@ -367,6 +370,188 @@ def _build_auth_session_response(user: dict[str, str], token: str, expires_at: f
     )
 
 
+def _normalize_oauth_provider(provider: str) -> str:
+    value = provider.strip().lower()
+    if value not in SUPPORTED_OAUTH_PROVIDERS:
+        raise HTTPException(status_code=400, detail="provider must be one of: google, kakao, naver")
+    return value
+
+
+def _oauth_client_config(settings: Settings, provider: str) -> tuple[str, str]:
+    if provider == "google":
+        client_id = settings.google_client_id.strip()
+        client_secret = settings.google_client_secret.strip()
+    elif provider == "kakao":
+        client_id = settings.kakao_client_id.strip()
+        client_secret = settings.kakao_client_secret.strip()
+    else:
+        client_id = settings.naver_client_id.strip()
+        client_secret = settings.naver_client_secret.strip()
+
+    if not client_id:
+        raise HTTPException(status_code=400, detail=f"{provider.upper()} client id is not configured")
+    if provider in {"google", "naver"} and not client_secret:
+        raise HTTPException(status_code=400, detail=f"{provider.upper()} client secret is not configured")
+    return client_id, client_secret
+
+
+def _build_oauth_callback_url(settings: Settings, request: Request, provider: str) -> str:
+    base_url = settings.auth_public_base_url.strip().rstrip("/")
+    if not base_url:
+        forwarded_proto = (request.headers.get("x-forwarded-proto") or "").strip()
+        forwarded_host = (request.headers.get("x-forwarded-host") or "").strip()
+        scheme = forwarded_proto or request.url.scheme
+        host = forwarded_host or request.url.netloc
+        base_url = f"{scheme}://{host}"
+    return f"{base_url}/api/auth/oauth/{provider}/callback"
+
+
+def _append_query_to_url(url: str, params: dict[str, str | float]) -> str:
+    parsed = urllib_parse.urlsplit(url)
+    current_query = dict(urllib_parse.parse_qsl(parsed.query, keep_blank_values=True))
+    for key, value in params.items():
+        current_query[key] = str(value)
+    updated_query = urllib_parse.urlencode(current_query)
+    return urllib_parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, updated_query, parsed.fragment))
+
+
+def _oauth_error_redirect(mobile_redirect_uri: str, message: str) -> RedirectResponse:
+    return RedirectResponse(url=_append_query_to_url(mobile_redirect_uri, {"error": message}), status_code=302)
+
+
+def _http_post_form_json(url: str, payload: dict[str, str]) -> dict[str, object]:
+    body = urllib_parse.urlencode(payload).encode("utf-8")
+    req = urllib_request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=15) as response:
+            raw = response.read().decode("utf-8")
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise HTTPException(status_code=400, detail=f"OAuth token exchange failed: {detail or exc.reason}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"OAuth token exchange failed: {exc}") from exc
+
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"OAuth token response parse failed: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=500, detail="OAuth token response is invalid")
+    return parsed
+
+
+def _http_get_json(url: str, headers: dict[str, str] | None = None) -> dict[str, object]:
+    req = urllib_request.Request(url, headers=headers or {"Accept": "application/json"}, method="GET")
+    try:
+        with urllib_request.urlopen(req, timeout=15) as response:
+            raw = response.read().decode("utf-8")
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise HTTPException(status_code=400, detail=f"OAuth profile fetch failed: {detail or exc.reason}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"OAuth profile fetch failed: {exc}") from exc
+
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"OAuth profile response parse failed: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=500, detail="OAuth profile response is invalid")
+    return parsed
+
+
+def _google_profile(settings: Settings, code: str, callback_url: str) -> tuple[str, str | None, str | None]:
+    client_id, client_secret = _oauth_client_config(settings, "google")
+    token_data = _http_post_form_json(
+        "https://oauth2.googleapis.com/token",
+        {
+            "code": code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": callback_url,
+            "grant_type": "authorization_code",
+        },
+    )
+    access_token = str(token_data.get("access_token") or "").strip()
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Google access token is missing")
+
+    profile = _http_get_json(
+        "https://openidconnect.googleapis.com/v1/userinfo",
+        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+    )
+    provider_user_id = str(profile.get("sub") or "").strip()
+    if not provider_user_id:
+        raise HTTPException(status_code=400, detail="Google user id is missing")
+    email = str(profile.get("email") or "").strip() or None
+    display_name = str(profile.get("name") or profile.get("given_name") or "").strip() or None
+    return provider_user_id, email, display_name
+
+
+def _kakao_profile(settings: Settings, code: str, callback_url: str) -> tuple[str, str | None, str | None]:
+    client_id, client_secret = _oauth_client_config(settings, "kakao")
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "redirect_uri": callback_url,
+        "code": code,
+    }
+    if client_secret:
+        payload["client_secret"] = client_secret
+    token_data = _http_post_form_json("https://kauth.kakao.com/oauth/token", payload)
+    access_token = str(token_data.get("access_token") or "").strip()
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Kakao access token is missing")
+
+    profile = _http_get_json(
+        "https://kapi.kakao.com/v2/user/me",
+        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+    )
+    provider_user_id = str(profile.get("id") or "").strip()
+    if not provider_user_id:
+        raise HTTPException(status_code=400, detail="Kakao user id is missing")
+
+    account = profile.get("kakao_account") if isinstance(profile.get("kakao_account"), dict) else {}
+    properties = profile.get("properties") if isinstance(profile.get("properties"), dict) else {}
+    email = str(account.get("email") or "").strip() or None
+    display_name = str(properties.get("nickname") or "").strip() or None
+    return provider_user_id, email, display_name
+
+
+def _naver_profile(settings: Settings, code: str, state: str) -> tuple[str, str | None, str | None]:
+    client_id, client_secret = _oauth_client_config(settings, "naver")
+    token_query = urllib_parse.urlencode(
+        {
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "state": state,
+        }
+    )
+    token_data = _http_get_json(f"https://nid.naver.com/oauth2.0/token?{token_query}")
+    access_token = str(token_data.get("access_token") or "").strip()
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Naver access token is missing")
+
+    profile = _http_get_json(
+        "https://openapi.naver.com/v1/nid/me",
+        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+    )
+    response_data = profile.get("response") if isinstance(profile.get("response"), dict) else {}
+    provider_user_id = str(response_data.get("id") or "").strip()
+    if not provider_user_id:
+        raise HTTPException(status_code=400, detail="Naver user id is missing")
+    email = str(response_data.get("email") or "").strip() or None
+    display_name = str(response_data.get("name") or response_data.get("nickname") or "").strip() or None
+    return provider_user_id, email, display_name
+
+
 @app.post("/api/auth/register", response_model=AuthSessionResponse)
 def register_auth(
     body: AuthRegisterRequest,
@@ -419,6 +604,101 @@ def logout_auth(
     if token:
         _get_auth_store(settings).invalidate_session(token)
     return {"status": "ok"}
+
+
+@app.get("/api/auth/oauth/{provider}/start")
+def oauth_start(
+    provider: str,
+    request: Request,
+    mobile_redirect_uri: str | None = Query(default=None),
+    settings: Settings = Depends(get_settings),
+) -> RedirectResponse:
+    selected_provider = _normalize_oauth_provider(provider)
+    client_id, _ = _oauth_client_config(settings, selected_provider)
+    redirect_uri = (mobile_redirect_uri or settings.auth_mobile_redirect_uri).strip()
+    if not redirect_uri:
+        raise HTTPException(status_code=400, detail="mobile_redirect_uri is required")
+
+    store = _get_auth_store(settings)
+    oauth_state = store.create_oauth_state(selected_provider, redirect_uri)
+    callback_url = _build_oauth_callback_url(settings, request, selected_provider)
+
+    if selected_provider == "google":
+        params = {
+            "client_id": client_id,
+            "redirect_uri": callback_url,
+            "response_type": "code",
+            "scope": "openid email profile",
+            "state": oauth_state,
+            "prompt": "select_account",
+        }
+        auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urllib_parse.urlencode(params)}"
+    elif selected_provider == "kakao":
+        params = {
+            "client_id": client_id,
+            "redirect_uri": callback_url,
+            "response_type": "code",
+            "state": oauth_state,
+        }
+        auth_url = f"https://kauth.kakao.com/oauth/authorize?{urllib_parse.urlencode(params)}"
+    else:
+        params = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": callback_url,
+            "state": oauth_state,
+        }
+        auth_url = f"https://nid.naver.com/oauth2.0/authorize?{urllib_parse.urlencode(params)}"
+
+    return RedirectResponse(url=auth_url, status_code=302)
+
+
+@app.get("/api/auth/oauth/{provider}/callback")
+def oauth_callback(
+    provider: str,
+    request: Request,
+    code: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+    settings: Settings = Depends(get_settings),
+) -> RedirectResponse:
+    selected_provider = _normalize_oauth_provider(provider)
+    store = _get_auth_store(settings)
+    mobile_redirect_uri = store.consume_oauth_state(state or "", selected_provider)
+    if not mobile_redirect_uri:
+        raise HTTPException(status_code=400, detail="OAuth state is invalid or expired")
+
+    if error:
+        return _oauth_error_redirect(mobile_redirect_uri, f"{selected_provider} login failed: {error}")
+    if not code:
+        return _oauth_error_redirect(mobile_redirect_uri, "OAuth code is missing")
+
+    callback_url = _build_oauth_callback_url(settings, request, selected_provider)
+    try:
+        if selected_provider == "google":
+            provider_user_id, email, display_name = _google_profile(settings, code, callback_url)
+        elif selected_provider == "kakao":
+            provider_user_id, email, display_name = _kakao_profile(settings, code, callback_url)
+        else:
+            provider_user_id, email, display_name = _naver_profile(settings, code, state or "")
+
+        user = store.find_or_create_social_user(selected_provider, provider_user_id, email, display_name)
+        access_token, expires_at = store.create_session(user["id"])
+        return RedirectResponse(
+            url=_append_query_to_url(
+                mobile_redirect_uri,
+                {
+                    "access_token": access_token,
+                    "expires_at": str(expires_at),
+                    "provider": selected_provider,
+                },
+            ),
+            status_code=302,
+        )
+    except HTTPException as exc:
+        return _oauth_error_redirect(mobile_redirect_uri, str(exc.detail))
+    except Exception as exc:
+        return _oauth_error_redirect(mobile_redirect_uri, f"OAuth login failed: {exc}")
 
 
 @app.post("/api/transcribe", response_model=TranscriptionResponse)

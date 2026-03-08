@@ -15,9 +15,11 @@ import {
 import { LinearGradient } from 'expo-linear-gradient';
 import Constants from 'expo-constants';
 import { Directory, File, Paths } from 'expo-file-system';
+import * as Linking from 'expo-linking';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Notifications from 'expo-notifications';
 import * as Sharing from 'expo-sharing';
+import * as WebBrowser from 'expo-web-browser';
 import {
   RecordingPresets,
   requestNotificationPermissionsAsync,
@@ -96,6 +98,8 @@ type AuthUserProfile = {
   display_name: string;
 };
 
+type SocialProvider = 'kakao' | 'google' | 'naver';
+
 const FALLBACK_API_URL = Platform.OS === 'android' ? 'http://10.0.2.2:8000' : 'http://localhost:8000';
 const PENDING_JOBS_FILE = new File(Paths.document, 'pending-jobs.json');
 const AUTH_SESSION_FILE = new File(Paths.document, 'auth-session.json');
@@ -104,6 +108,13 @@ const FOLDER_ICON_OPTIONS = ['📁', '📘', '📗', '📕', '🧪', '💻', '�
 const FOLDER_COLOR_OPTIONS = ['#DBEAFE', '#E9D5FF', '#FCE7F3', '#DCFCE7', '#FEF3C7', '#E0F2FE', '#F1F5F9'];
 const DEFAULT_FOLDER_ICON = '📁';
 const DEFAULT_FOLDER_COLOR = '#DBEAFE';
+const SOCIAL_PROVIDER_LABELS: Record<SocialProvider, string> = {
+  kakao: '카카오',
+  google: '구글',
+  naver: '네이버',
+};
+
+WebBrowser.maybeCompleteAuthSession();
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -508,6 +519,59 @@ export default function App() {
       setStatusMessage(`${user.display_name} 계정으로 로그인되었습니다.`);
     } catch (error) {
       setStatusMessage(`인증 실패: ${formatError(error)}`);
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const submitSocialAuth = async (provider: SocialProvider) => {
+    try {
+      setAuthBusy(true);
+      const redirectUri = Linking.createURL('auth/callback');
+      const startUrl =
+        `${apiBaseUrl}/api/auth/oauth/${provider}/start?mobile_redirect_uri=` + encodeURIComponent(redirectUri);
+
+      const result = await WebBrowser.openAuthSessionAsync(startUrl, redirectUri);
+      if (result.type !== 'success' || !result.url) {
+        if (result.type === 'cancel' || result.type === 'dismiss') {
+          setStatusMessage('소셜 로그인이 취소되었습니다.');
+          return;
+        }
+        throw new Error('소셜 로그인 창을 완료하지 못했습니다.');
+      }
+
+      const parsed = Linking.parse(result.url);
+      const query = (parsed.queryParams ?? {}) as Record<string, string | string[] | undefined>;
+      const errorText = firstQueryValue(query.error);
+      if (errorText) {
+        throw new Error(decodeURIComponentSafe(errorText));
+      }
+
+      const token = firstQueryValue(query.access_token);
+      if (!token) {
+        throw new Error('소셜 로그인 토큰을 받지 못했습니다.');
+      }
+
+      const meResponse = await fetch(`${apiBaseUrl}/api/auth/me`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const mePayload = await readJsonSafely(meResponse);
+      if (!meResponse.ok) {
+        throw new Error(getApiErrorMessage(mePayload, meResponse, '소셜 로그인 실패'));
+      }
+      const user = normalizeAuthUser(mePayload);
+      if (!user) {
+        throw new Error('소셜 로그인 응답이 올바르지 않습니다.');
+      }
+
+      setAuthToken(token);
+      setAuthUser(user);
+      persistAuthSession(token, user);
+      setAuthModalVisible(false);
+      setAuthPassword('');
+      setStatusMessage(`${SOCIAL_PROVIDER_LABELS[provider]} 계정으로 로그인되었습니다.`);
+    } catch (error) {
+      setStatusMessage(`소셜 인증 실패: ${formatError(error)}`);
     } finally {
       setAuthBusy(false);
     }
@@ -2078,6 +2142,30 @@ export default function App() {
               autoCorrect={false}
               secureTextEntry
             />
+            <Text style={styles.modalLabel}>소셜 로그인 / 회원가입</Text>
+            <View style={styles.socialAuthRow}>
+              <Pressable
+                style={[styles.socialAuthButton, styles.socialKakao, authBusy && styles.disabledButton]}
+                onPress={() => void submitSocialAuth('kakao')}
+                disabled={authBusy}
+              >
+                <Text style={[styles.socialAuthButtonText, styles.socialKakaoText]}>카카오</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.socialAuthButton, styles.socialGoogle, authBusy && styles.disabledButton]}
+                onPress={() => void submitSocialAuth('google')}
+                disabled={authBusy}
+              >
+                <Text style={[styles.socialAuthButtonText, styles.socialGoogleText]}>구글</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.socialAuthButton, styles.socialNaver, authBusy && styles.disabledButton]}
+                onPress={() => void submitSocialAuth('naver')}
+                disabled={authBusy}
+              >
+                <Text style={[styles.socialAuthButtonText, styles.socialNaverText]}>네이버</Text>
+              </Pressable>
+            </View>
             <View style={styles.modalActions}>
               <Pressable style={[styles.modalButton, styles.modalCancel]} onPress={() => setAuthModalVisible(false)}>
                 <Text style={styles.modalButtonText}>취소</Text>
@@ -2489,6 +2577,21 @@ function normalizeAuthUser(payload: any): AuthUserProfile | null {
     email,
     display_name: displayName || email.split('@')[0] || 'user',
   };
+}
+
+function firstQueryValue(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) {
+    return typeof value[0] === 'string' ? value[0] : '';
+  }
+  return typeof value === 'string' ? value : '';
+}
+
+function decodeURIComponentSafe(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }
 
 function recordingMimeType(fileName: string): string {
@@ -3049,6 +3152,43 @@ const styles = StyleSheet.create({
     color: '#334155',
     fontSize: 12,
     fontWeight: '700',
+  },
+  socialAuthRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 6,
+  },
+  socialAuthButton: {
+    flex: 1,
+    borderRadius: 10,
+    paddingVertical: 10,
+    borderWidth: 1,
+    alignItems: 'center',
+  },
+  socialAuthButtonText: {
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  socialKakao: {
+    backgroundColor: '#FEE500',
+    borderColor: '#E2C900',
+  },
+  socialGoogle: {
+    backgroundColor: '#FFFFFF',
+    borderColor: '#CBD5E1',
+  },
+  socialNaver: {
+    backgroundColor: '#03C75A',
+    borderColor: '#02A24A',
+  },
+  socialKakaoText: {
+    color: '#3C1E1E',
+  },
+  socialGoogleText: {
+    color: '#1F2937',
+  },
+  socialNaverText: {
+    color: '#FFFFFF',
   },
   optionWrap: {
     flexDirection: 'row',

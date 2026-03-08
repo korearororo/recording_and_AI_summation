@@ -18,6 +18,11 @@ If you want to use the app from any network (not only your home/PC LAN), deploy 
 2. Set environment variables on the cloud service:
    - `OPENAI_API_KEY=<your key>`
    - `ALLOWED_ORIGINS=*` (or your exact app origin list)
+   - `AUTH_PUBLIC_BASE_URL=https://<your-backend-domain>`
+   - `AUTH_MOBILE_REDIRECT_URI=meetingnoteai://auth/callback`
+   - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
+   - `KAKAO_CLIENT_ID` (`KAKAO_CLIENT_SECRET` optional)
+   - `NAVER_CLIENT_ID`, `NAVER_CLIENT_SECRET`
 3. Confirm health check:
    - `GET https://<your-backend-domain>/health` -> `{"status":"ok"}`
 4. Rebuild mobile app with:
@@ -29,6 +34,8 @@ If you want to use the app from any network (not only your home/PC LAN), deploy 
 - `POST /api/summarize` : transcript -> summary
 - `POST /api/summarize-chat` : transcript -> summary (chat model prompt)
 - `POST /api/process` : audio file -> transcript + summary
+- `GET /api/auth/oauth/{provider}/start` : social login start redirect (`provider`: `google|kakao|naver`)
+- `GET /api/auth/oauth/{provider}/callback` : social login callback -> app deep link redirect
 
 ## Long Lecture Transcription
 - Files larger than `TRANSCRIBE_MAX_FILE_MB` are automatically split and transcribed chunk-by-chunk.

@@ -12,6 +12,22 @@ services:
         sync: false
       - key: ALLOWED_ORIGINS
         value: "*"
+      - key: AUTH_PUBLIC_BASE_URL
+        value: "https://recording-ai-backend.onrender.com"
+      - key: AUTH_MOBILE_REDIRECT_URI
+        value: "meetingnoteai://auth/callback"
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: KAKAO_CLIENT_ID
+        sync: false
+      - key: KAKAO_CLIENT_SECRET
+        sync: false
+      - key: NAVER_CLIENT_ID
+        sync: false
+      - key: NAVER_CLIENT_SECRET
+        sync: false
       - key: TRANSCRIBE_MODEL
         value: "gpt-4o-mini-transcribe"
       - key: SUMMARY_MODEL

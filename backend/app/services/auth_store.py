@@ -12,6 +12,7 @@ from threading import Lock
 
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 PBKDF2_ITERATIONS = 200_000
+DEFAULT_OAUTH_STATE_TTL_SECONDS = 10 * 60
 
 
 class AuthStore:
@@ -54,8 +55,33 @@ class AuthStore:
                     )
                     """
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS social_identities (
+                        provider TEXT NOT NULL,
+                        provider_user_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        PRIMARY KEY (provider, provider_user_id),
+                        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS oauth_states (
+                        state TEXT PRIMARY KEY,
+                        provider TEXT NOT NULL,
+                        mobile_redirect_uri TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        expires_at REAL NOT NULL
+                    )
+                    """
+                )
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_social_identities_user_id ON social_identities(user_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_oauth_states_expires_at ON oauth_states(expires_at)")
                 conn.commit()
 
     def _normalize_email(self, email: str) -> str:
@@ -72,6 +98,9 @@ class AuthStore:
 
     def _cleanup_expired_sessions(self, conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (time.time(),))
+
+    def _cleanup_expired_oauth_states(self, conn: sqlite3.Connection) -> None:
+        conn.execute("DELETE FROM oauth_states WHERE expires_at <= ?", (time.time(),))
 
     def create_user(self, email: str, password: str, display_name: str | None = None) -> dict[str, str]:
         normalized_email = self._normalize_email(email)
@@ -174,3 +203,126 @@ class AuthStore:
             with self._connect() as conn:
                 conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
                 conn.commit()
+
+    def create_oauth_state(
+        self,
+        provider: str,
+        mobile_redirect_uri: str,
+        ttl_seconds: int = DEFAULT_OAUTH_STATE_TTL_SECONDS,
+    ) -> str:
+        clean_provider = provider.strip().lower()
+        redirect = mobile_redirect_uri.strip()
+        if not clean_provider:
+            raise ValueError("provider is required")
+        if not redirect:
+            raise ValueError("mobile_redirect_uri is required")
+
+        state = secrets.token_urlsafe(32)
+        now = time.time()
+        expires_at = now + max(int(ttl_seconds), 60)
+        with self._lock:
+            with self._connect() as conn:
+                self._cleanup_expired_oauth_states(conn)
+                conn.execute(
+                    """
+                    INSERT INTO oauth_states (state, provider, mobile_redirect_uri, created_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (state, clean_provider, redirect, now, expires_at),
+                )
+                conn.commit()
+        return state
+
+    def consume_oauth_state(self, state: str, provider: str) -> str | None:
+        clean_state = state.strip()
+        clean_provider = provider.strip().lower()
+        if not clean_state or not clean_provider:
+            return None
+
+        with self._lock:
+            with self._connect() as conn:
+                self._cleanup_expired_oauth_states(conn)
+                row = conn.execute(
+                    """
+                    SELECT mobile_redirect_uri
+                    FROM oauth_states
+                    WHERE state = ? AND provider = ? AND expires_at > ?
+                    """,
+                    (clean_state, clean_provider, time.time()),
+                ).fetchone()
+                conn.execute("DELETE FROM oauth_states WHERE state = ?", (clean_state,))
+                conn.commit()
+                if row is None:
+                    return None
+                return str(row["mobile_redirect_uri"])
+
+    def find_or_create_social_user(
+        self,
+        provider: str,
+        provider_user_id: str,
+        email: str | None,
+        display_name: str | None = None,
+    ) -> dict[str, str]:
+        clean_provider = provider.strip().lower()
+        clean_provider_user_id = provider_user_id.strip()
+        if not clean_provider or not clean_provider_user_id:
+            raise ValueError("provider and provider_user_id are required")
+
+        normalized_email = self._normalize_email(email or "")
+        if not EMAIL_PATTERN.match(normalized_email):
+            normalized_email = f"{clean_provider}_{clean_provider_user_id}@social.local"
+        clean_name = (display_name or normalized_email.split("@")[0]).strip() or "user"
+
+        with self._lock:
+            with self._connect() as conn:
+                existing = conn.execute(
+                    """
+                    SELECT u.id, u.email, u.display_name
+                    FROM social_identities s
+                    JOIN users u ON u.id = s.user_id
+                    WHERE s.provider = ? AND s.provider_user_id = ?
+                    """,
+                    (clean_provider, clean_provider_user_id),
+                ).fetchone()
+                if existing is not None:
+                    return {
+                        "id": str(existing["id"]),
+                        "email": str(existing["email"]),
+                        "display_name": str(existing["display_name"]),
+                    }
+
+                user_row = conn.execute(
+                    "SELECT id, email, display_name FROM users WHERE email = ?",
+                    (normalized_email,),
+                ).fetchone()
+                if user_row is None:
+                    user_id = str(uuid.uuid4())
+                    created_at = time.time()
+                    # Social-only account still needs a stored hash for local schema compatibility.
+                    salt_hex = secrets.token_hex(16)
+                    random_password = secrets.token_urlsafe(32)
+                    password_hash = self._hash_password(random_password, salt_hex)
+                    conn.execute(
+                        """
+                        INSERT INTO users (id, email, password_salt, password_hash, display_name, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (user_id, normalized_email, salt_hex, password_hash, clean_name, created_at),
+                    )
+                    user = {"id": user_id, "email": normalized_email, "display_name": clean_name}
+                else:
+                    user = {
+                        "id": str(user_row["id"]),
+                        "email": str(user_row["email"]),
+                        "display_name": str(user_row["display_name"]),
+                    }
+
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO social_identities (provider, provider_user_id, user_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (clean_provider, clean_provider_user_id, user["id"], time.time()),
+                )
+                conn.commit()
+                return user
