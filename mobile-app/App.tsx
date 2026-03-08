@@ -1,7 +1,8 @@
-﻿import { useEffect, useMemo, useState } from 'react';
+﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Modal,
   Platform,
   Pressable,
   SafeAreaView,
@@ -12,7 +13,10 @@ import {
   View,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
+import Constants from 'expo-constants';
 import { Directory, File, Paths } from 'expo-file-system';
+import * as DocumentPicker from 'expo-document-picker';
+import * as Notifications from 'expo-notifications';
 import * as Sharing from 'expo-sharing';
 import {
   RecordingPresets,
@@ -38,6 +42,8 @@ type SubjectMeta = {
   id: string;
   name: string;
   tag?: SubjectTag;
+  icon?: string;
+  color?: string;
   createdAt: number;
 };
 
@@ -45,10 +51,13 @@ type SubjectItem = {
   id: string;
   name: string;
   tag: SubjectTag;
+  icon: string;
+  color: string;
   hasRecording: boolean;
   hasTranscript: boolean;
   hasSummary: boolean;
   updatedAt: number;
+  previewFiles: string[];
 };
 
 type RecordingItem = {
@@ -72,7 +81,31 @@ type SubjectPaths = {
   legacySummary: File;
 };
 
+type PendingJob = {
+  jobId: string;
+  jobType: 'transcribe' | 'summarize';
+  mode: ProcessMode;
+  subjectId: string;
+  recordingId: string;
+  fileName: string;
+};
+
 const FALLBACK_API_URL = Platform.OS === 'android' ? 'http://10.0.2.2:8000' : 'http://localhost:8000';
+const PENDING_JOBS_FILE = new File(Paths.document, 'pending-jobs.json');
+const TEMP_RECORDINGS_ROOT = new Directory(Paths.cache, 'temp-recordings');
+const FOLDER_ICON_OPTIONS = ['📁', '📘', '📗', '📕', '🧪', '💻', '📊', '🎵'];
+const FOLDER_COLOR_OPTIONS = ['#DBEAFE', '#E9D5FF', '#FCE7F3', '#DCFCE7', '#FEF3C7', '#E0F2FE', '#F1F5F9'];
+const DEFAULT_FOLDER_ICON = '📁';
+const DEFAULT_FOLDER_COLOR = '#DBEAFE';
+
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+    shouldShowBanner: true,
+    shouldShowList: true,
+  }),
+});
 
 const SUBJECTS_ROOT = new Directory(Paths.document, 'subjects');
 const LECTURE_RECORDING_PRESET = {
@@ -103,17 +136,39 @@ export default function App() {
 
   const [subjects, setSubjects] = useState<SubjectItem[]>([]);
   const [selectedSubjectId, setSelectedSubjectId] = useState<string | null>(null);
-  const [newSubjectName, setNewSubjectName] = useState('');
-  const [newSubjectTag, setNewSubjectTag] = useState<SubjectTag>('major');
+  const [folderModalVisible, setFolderModalVisible] = useState(false);
+  const [newFolderName, setNewFolderName] = useState('');
+  const [newFolderIcon, setNewFolderIcon] = useState(DEFAULT_FOLDER_ICON);
+  const [newFolderColor, setNewFolderColor] = useState(DEFAULT_FOLDER_COLOR);
+  const [fabOpen, setFabOpen] = useState(false);
+  const [uploadModalVisible, setUploadModalVisible] = useState(false);
+  const [uploadMode, setUploadMode] = useState<'file' | 'link'>('file');
+  const [uploadFileUri, setUploadFileUri] = useState('');
+  const [uploadName, setUploadName] = useState('');
+  const [uploadVideoLink, setUploadVideoLink] = useState('');
+  const [uploadTargetFolderId, setUploadTargetFolderId] = useState<string | null>(null);
+  const [recordingDraftUri, setRecordingDraftUri] = useState<string | null>(null);
+  const [recordingSaveVisible, setRecordingSaveVisible] = useState(false);
+  const [recordingSaveName, setRecordingSaveName] = useState('');
+  const [recordingTargetFolderId, setRecordingTargetFolderId] = useState<string | null>(null);
 
   const [recordingUri, setRecordingUri] = useState<string | null>(null);
   const [recordings, setRecordings] = useState<RecordingItem[]>([]);
   const [selectedRecordingId, setSelectedRecordingId] = useState<string | null>(null);
   const [transcript, setTranscript] = useState('');
   const [summary, setSummary] = useState('');
+  const [screenMode, setScreenMode] = useState<'home' | 'subject' | 'detail' | 'record'>('home');
+  const [editorVisible, setEditorVisible] = useState(false);
+  const [editorTarget, setEditorTarget] = useState<'transcript' | 'summary' | null>(null);
+  const [editorText, setEditorText] = useState('');
+  const [renameVisible, setRenameVisible] = useState(false);
+  const [renameText, setRenameText] = useState('');
+  const [expoPushToken, setExpoPushToken] = useState('');
+  const [pendingJobs, setPendingJobs] = useState<PendingJob[]>([]);
+  const pollingRef = useRef(false);
 
-  const [transcribeMode, setTranscribeMode] = useState<ProcessMode>('api');
-  const [summaryMode, setSummaryMode] = useState<ProcessMode>('api');
+  const [transcribeMode, setTranscribeMode] = useState<ProcessMode>('chat');
+  const [summaryMode, setSummaryMode] = useState<ProcessMode>('chat');
 
   const [statusMessage, setStatusMessage] = useState('준비 완료');
   const [isBusy, setIsBusy] = useState(false);
@@ -161,6 +216,17 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (pendingJobs.length === 0) {
+      return;
+    }
+    const timer = setInterval(() => {
+      void pollPendingJobs();
+    }, 5000);
+    void pollPendingJobs();
+    return () => clearInterval(timer);
+  }, [pendingJobs]);
+
+  useEffect(() => {
     if (!selectedSubjectId) {
       setRecordingUri(null);
       setRecordings([]);
@@ -179,6 +245,8 @@ export default function App() {
 
   const initialize = async () => {
     ensureSubjectsRoot();
+    await setupNotifications();
+    await restorePendingJobs();
     await loadSubjects();
   };
 
@@ -198,9 +266,9 @@ export default function App() {
   };
 
   const createSubject = async () => {
-    const name = newSubjectName.trim();
+    const name = newFolderName.trim();
     if (!name) {
-      setStatusMessage('과목명을 입력해주세요.');
+      setStatusMessage('폴더 이름을 입력해주세요.');
       return;
     }
 
@@ -215,26 +283,30 @@ export default function App() {
       const meta: SubjectMeta = {
         id,
         name,
-        tag: newSubjectTag,
+        tag: 'major',
+        icon: newFolderIcon || DEFAULT_FOLDER_ICON,
+        color: normalizeFolderColor(newFolderColor),
         createdAt: Date.now(),
       };
       writeText(paths.meta, JSON.stringify(meta, null, 2));
 
-      setNewSubjectName('');
-      setNewSubjectTag('major');
+      setNewFolderName('');
+      setNewFolderIcon(DEFAULT_FOLDER_ICON);
+      setNewFolderColor(DEFAULT_FOLDER_COLOR);
+      setFolderModalVisible(false);
       setSelectedSubjectId(id);
       await loadSubjects(id);
-      setStatusMessage(`과목 '${name}' 생성 완료 (${SUBJECT_TAG_STYLES[newSubjectTag].label})`);
+      setStatusMessage(`폴더 생성 완료: ${newFolderIcon} ${name}`);
     } catch (error) {
-      setStatusMessage(`과목 생성 실패: ${formatError(error)}`);
+      setStatusMessage(`폴더 생성 실패: ${formatError(error)}`);
     }
   };
 
   const openDirectory = (subjectId: string) => {
     setSelectedSubjectId(subjectId);
+    setScreenMode('subject');
     const picked = subjects.find((subject) => subject.id === subjectId);
-    const tag = picked ? SUBJECT_TAG_STYLES[picked.tag].label : '';
-    setStatusMessage(`디렉토리 열림: ${picked?.name ?? subjectId}${tag ? ` (${tag})` : ''}`);
+    setStatusMessage(`폴더 열림: ${picked?.name ?? subjectId}`);
   };
 
   const selectRecording = async (recordingId: string) => {
@@ -245,16 +317,333 @@ export default function App() {
     await loadSubjectFiles(selectedSubjectId, recordingId);
     const picked = items.find((item) => item.id === recordingId);
     if (picked) {
+      setScreenMode('detail');
       setStatusMessage(`녹음 파일 선택: ${picked.title}`);
     }
   };
 
-  const startRecording = async () => {
-    if (!selectedSubjectId) {
-      setStatusMessage('먼저 과목을 선택해주세요.');
+  const setupNotifications = async () => {
+    try {
+      if (Platform.OS === 'android') {
+        await Notifications.setNotificationChannelAsync('job-status', {
+          name: '전사/요약 상태',
+          importance: Notifications.AndroidImportance.HIGH,
+          vibrationPattern: [0, 250, 250, 250],
+          sound: 'default',
+        });
+      }
+
+      const existing = await Notifications.getPermissionsAsync();
+      let finalStatus = existing.status;
+      if (finalStatus !== 'granted') {
+        const requested = await Notifications.requestPermissionsAsync();
+        finalStatus = requested.status;
+      }
+      if (finalStatus !== 'granted') {
+        setStatusMessage('알림 권한이 없어 백그라운드 완료 알림이 제한됩니다.');
+        return;
+      }
+
+      const projectId =
+        Constants.expoConfig?.extra?.eas?.projectId ??
+        (Constants as any).easConfig?.projectId ??
+        undefined;
+      if (!projectId) {
+        return;
+      }
+      const token = (await Notifications.getExpoPushTokenAsync({ projectId })).data;
+      setExpoPushToken(token);
+    } catch (error) {
+      setStatusMessage(`알림 설정 실패: ${formatError(error)}`);
+    }
+  };
+
+  const notifyLocal = async (title: string, body: string) => {
+    try {
+      await Notifications.scheduleNotificationAsync({
+        content: {
+          title,
+          body,
+          sound: 'default',
+        },
+        trigger: null,
+      });
+    } catch {
+      // Keep core flow even if local notification fails.
+    }
+  };
+
+  const restorePendingJobs = async () => {
+    if (!PENDING_JOBS_FILE.exists) {
+      setPendingJobs([]);
+      return;
+    }
+    try {
+      const raw = await PENDING_JOBS_FILE.text();
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) {
+        setPendingJobs([]);
+        return;
+      }
+      const jobs = parsed.filter((value): value is PendingJob => {
+        return (
+          typeof value?.jobId === 'string' &&
+          (value?.jobType === 'transcribe' || value?.jobType === 'summarize') &&
+          typeof value?.subjectId === 'string' &&
+          typeof value?.recordingId === 'string'
+        );
+      });
+      setPendingJobs(jobs);
+    } catch {
+      setPendingJobs([]);
+    }
+  };
+
+  const persistPendingJobs = (jobs: PendingJob[]) => {
+    try {
+      writeText(PENDING_JOBS_FILE, JSON.stringify(jobs));
+    } catch {
+      // If persistence fails, job polling still works for current session.
+    }
+  };
+
+  const addPendingJob = (job: PendingJob) => {
+    setPendingJobs((prev) => {
+      const next = [...prev.filter((item) => item.jobId !== job.jobId), job];
+      persistPendingJobs(next);
+      return next;
+    });
+  };
+
+  const removePendingJob = (jobId: string) => {
+    setPendingJobs((prev) => {
+      const next = prev.filter((item) => item.jobId !== jobId);
+      persistPendingJobs(next);
+      return next;
+    });
+  };
+
+  const resolveFilesForPendingJob = (job: PendingJob) => {
+    const paths = getSubjectPaths(job.subjectId);
+    if (job.recordingId === 'legacy-recording.m4a') {
+      return {
+        transcriptFile: paths.legacyTranscript,
+        summaryFile: paths.legacySummary,
+      };
+    }
+    const base = stripAudioExtension(job.recordingId);
+    return {
+      transcriptFile: new File(paths.transcriptsDir, `${base}.txt`),
+      summaryFile: new File(paths.summariesDir, `${base}.txt`),
+    };
+  };
+
+  const pollPendingJobs = async () => {
+    if (pollingRef.current || pendingJobs.length === 0) {
+      return;
+    }
+    pollingRef.current = true;
+
+    try {
+      for (const job of pendingJobs) {
+        try {
+          const response = await fetch(`${apiBaseUrl}/api/jobs/${job.jobId}`);
+          const data = await readJsonSafely(response);
+          if (!response.ok) {
+            continue;
+          }
+
+          const status = typeof data?.status === 'string' ? data.status : '';
+          if (status === 'completed') {
+            const files = resolveFilesForPendingJob(job);
+            if (job.jobType === 'transcribe') {
+              const value = typeof data?.transcript === 'string' ? data.transcript.trim() : '';
+              writeText(files.transcriptFile, value);
+              if (selectedRecordingId === job.recordingId) {
+                setTranscript(value);
+              }
+              await notifyLocal('전사 완료', `${job.fileName} 전사가 완료되었습니다.`);
+            } else {
+              const value = typeof data?.summary === 'string' ? data.summary.trim() : '';
+              writeText(files.summaryFile, value);
+              if (selectedRecordingId === job.recordingId) {
+                setSummary(value);
+              }
+              await notifyLocal('요약 완료', `${job.fileName} 요약이 완료되었습니다.`);
+            }
+            removePendingJob(job.jobId);
+            if (selectedSubjectId === job.subjectId) {
+              await refreshSelectedSubject(job.recordingId);
+            }
+            continue;
+          }
+
+          if (status === 'failed') {
+            await notifyLocal(
+              job.jobType === 'transcribe' ? '전사 실패' : '요약 실패',
+              `${job.fileName} ${job.jobType === 'transcribe' ? '전사' : '요약'} 실패`,
+            );
+            removePendingJob(job.jobId);
+          }
+        } catch {
+          // Ignore polling error for this cycle.
+        }
+      }
+    } finally {
+      pollingRef.current = false;
+    }
+  };
+
+  const openTranscriptEditor = () => {
+    setEditorTarget('transcript');
+    setEditorText(transcript);
+    setEditorVisible(true);
+  };
+
+  const openSummaryEditor = () => {
+    setEditorTarget('summary');
+    setEditorText(summary);
+    setEditorVisible(true);
+  };
+
+  const openRenameModal = () => {
+    if (!selectedRecording) {
+      setStatusMessage('이름 변경할 파일을 선택해주세요.');
+      return;
+    }
+    setRenameText(stripAudioExtension(selectedRecording.title));
+    setRenameVisible(true);
+  };
+
+  const saveEditedText = async () => {
+    if (!selectedRecording || !editorTarget) {
       return;
     }
 
+    try {
+      if (editorTarget === 'transcript') {
+        writeText(selectedRecording.transcriptFile, editorText);
+        setTranscript(editorText);
+      } else {
+        writeText(selectedRecording.summaryFile, editorText);
+        setSummary(editorText);
+      }
+      await refreshSelectedSubject(selectedRecording.id);
+      setEditorVisible(false);
+      setStatusMessage(editorTarget === 'transcript' ? '전사 내용 저장 완료' : '요약 내용 저장 완료');
+    } catch (error) {
+      setStatusMessage(`편집 저장 실패: ${formatError(error)}`);
+    }
+  };
+
+  const deleteCurrentRecording = () => {
+    if (!selectedRecording) {
+      setStatusMessage('삭제할 파일을 선택해주세요.');
+      return;
+    }
+
+    Alert.alert('삭제 확인', '정말 삭제하시겠습니까?', [
+      { text: '취소', style: 'cancel' },
+      {
+        text: '삭제',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            setIsBusy(true);
+            if (selectedRecording.recordingFile.exists) {
+              selectedRecording.recordingFile.delete();
+            }
+            if (selectedRecording.transcriptFile.exists) {
+              selectedRecording.transcriptFile.delete();
+            }
+            if (selectedRecording.summaryFile.exists) {
+              selectedRecording.summaryFile.delete();
+            }
+            await refreshSelectedSubject();
+            setScreenMode('subject');
+            setStatusMessage(`삭제 완료: ${selectedRecording.title}`);
+          } catch (error) {
+            setStatusMessage(`삭제 실패: ${formatError(error)}`);
+          } finally {
+            setIsBusy(false);
+          }
+        },
+      },
+    ]);
+  };
+
+  const renameCurrentRecording = async () => {
+    if (!selectedRecording || !selectedSubjectId) {
+      setStatusMessage('이름 변경할 파일을 선택해주세요.');
+      return;
+    }
+
+    const nextBaseName = stripAudioExtension(renameText.trim());
+    if (!nextBaseName) {
+      setStatusMessage('파일 이름을 입력해주세요.');
+      return;
+    }
+    if (/[\\/:*?"<>|]/.test(nextBaseName)) {
+      setStatusMessage('파일 이름에 사용할 수 없는 문자가 있습니다.');
+      return;
+    }
+
+    try {
+      setIsBusy(true);
+      const paths = getSubjectPaths(selectedSubjectId);
+      ensureRecordingDirs(paths);
+
+      const extensionMatch = selectedRecording.recordingFile.name.match(/\.[^/.]+$/);
+      const extension = extensionMatch?.[0] ?? '.m4a';
+      const nextRecordingName = `${nextBaseName}${extension}`;
+
+      const nextRecordingFile = new File(paths.recordingsDir, nextRecordingName);
+      const nextTranscriptFile = new File(paths.transcriptsDir, `${nextBaseName}.txt`);
+      const nextSummaryFile = new File(paths.summariesDir, `${nextBaseName}.txt`);
+
+      const sameRecordingName = selectedRecording.recordingFile.name === nextRecordingName;
+      const sameTranscriptName = selectedRecording.transcriptFile.name === `${nextBaseName}.txt`;
+      const sameSummaryName = selectedRecording.summaryFile.name === `${nextBaseName}.txt`;
+      if (sameRecordingName && sameTranscriptName && sameSummaryName) {
+        setRenameVisible(false);
+        setStatusMessage('파일 이름이 동일합니다.');
+        return;
+      }
+
+      if (!sameRecordingName && nextRecordingFile.exists) {
+        throw new Error('같은 이름의 녹음 파일이 이미 있습니다.');
+      }
+      if (!sameTranscriptName && nextTranscriptFile.exists) {
+        throw new Error('같은 이름의 전사 파일이 이미 있습니다.');
+      }
+      if (!sameSummaryName && nextSummaryFile.exists) {
+        throw new Error('같은 이름의 요약 파일이 이미 있습니다.');
+      }
+
+      if (selectedRecording.recordingFile.exists && !sameRecordingName) {
+        selectedRecording.recordingFile.copy(nextRecordingFile);
+        selectedRecording.recordingFile.delete();
+      }
+      if (selectedRecording.transcriptFile.exists && !sameTranscriptName) {
+        selectedRecording.transcriptFile.copy(nextTranscriptFile);
+        selectedRecording.transcriptFile.delete();
+      }
+      if (selectedRecording.summaryFile.exists && !sameSummaryName) {
+        selectedRecording.summaryFile.copy(nextSummaryFile);
+        selectedRecording.summaryFile.delete();
+      }
+
+      await refreshSelectedSubject(nextRecordingName);
+      setRenameVisible(false);
+      setStatusMessage(`파일 이름 변경 완료: ${nextRecordingName}`);
+    } catch (error) {
+      setStatusMessage(`파일 이름 변경 실패: ${formatError(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const startRecording = async () => {
     try {
       setStatusMessage('권한 확인 중...');
       await ensurePermissions();
@@ -275,13 +664,8 @@ export default function App() {
   };
 
   const stopRecording = async () => {
-    if (!selectedPaths) {
-      setStatusMessage('과목을 선택해주세요.');
-      return;
-    }
-
     try {
-      setStatusMessage('녹음 저장 중...');
+      setStatusMessage('녹음 종료 중...');
       await recorder.stop();
 
       const uri = recorder.uri ?? recorder.getStatus().url;
@@ -294,14 +678,6 @@ export default function App() {
         throw new Error('녹음 원본 파일을 찾지 못했습니다.');
       }
 
-      ensureRecordingDirs(selectedPaths);
-      const recordingFileName = `recording-${Date.now()}.m4a`;
-      const targetRecording = new File(selectedPaths.recordingsDir, recordingFileName);
-      if (targetRecording.exists) {
-        targetRecording.delete();
-      }
-      source.copy(targetRecording);
-
       await setAudioModeAsync({
         allowsRecording: false,
         playsInSilentMode: true,
@@ -309,16 +685,165 @@ export default function App() {
         interruptionMode: 'mixWithOthers',
       });
 
-      await refreshSelectedSubject(recordingFileName);
-      setStatusMessage(`녹음 완료: ${recordingFileName}`);
+      setRecordingDraftUri(uri);
+      setRecordingSaveName(`recording-${Date.now()}`);
+      setRecordingTargetFolderId(selectedSubjectId ?? subjects[0]?.id ?? null);
+      setRecordingSaveVisible(true);
+      setStatusMessage('녹음 완료. 파일명/저장 폴더를 선택해주세요.');
     } catch (error) {
       setStatusMessage(`녹음 중지 실패: ${formatError(error)}`);
+    }
+  };
+
+  const saveRecordedDraft = async () => {
+    if (!recordingDraftUri) {
+      setStatusMessage('저장할 녹음이 없습니다.');
+      return;
+    }
+    if (!recordingTargetFolderId) {
+      setStatusMessage('저장할 폴더를 선택해주세요.');
+      return;
+    }
+
+    try {
+      const baseName = sanitizeFileBaseName(recordingSaveName) || `recording-${Date.now()}`;
+      const fileName = `${baseName}.m4a`;
+      const source = new File(recordingDraftUri);
+      if (!source.exists) {
+        throw new Error('임시 녹음 파일을 찾지 못했습니다.');
+      }
+
+      const targetPaths = getSubjectPaths(recordingTargetFolderId);
+      ensureRecordingDirs(targetPaths);
+      const targetRecording = new File(targetPaths.recordingsDir, fileName);
+      if (targetRecording.exists) {
+        targetRecording.delete();
+      }
+      source.copy(targetRecording);
+
+      setRecordingDraftUri(null);
+      setRecordingSaveVisible(false);
+      setSelectedSubjectId(recordingTargetFolderId);
+      await loadSubjects(recordingTargetFolderId);
+      await loadSubjectFiles(recordingTargetFolderId, fileName);
+      setScreenMode('subject');
+      setStatusMessage(`녹음 저장 완료: ${fileName}`);
+    } catch (error) {
+      setStatusMessage(`녹음 저장 실패: ${formatError(error)}`);
+    }
+  };
+
+  const cancelRecordingSave = () => {
+    if (!recordingDraftUri) {
+      setRecordingSaveVisible(false);
+      return;
+    }
+
+    try {
+      ensureTempRecordingsRoot();
+      const source = new File(recordingDraftUri);
+      if (source.exists) {
+        const tempFile = new File(TEMP_RECORDINGS_ROOT, `temp-${Date.now()}.m4a`);
+        if (tempFile.exists) {
+          tempFile.delete();
+        }
+        source.copy(tempFile);
+      }
+      setStatusMessage('저장을 취소하여 임시 파일로 보관했습니다.');
+    } catch (error) {
+      setStatusMessage(`임시 저장 실패: ${formatError(error)}`);
+    } finally {
+      setRecordingDraftUri(null);
+      setRecordingSaveVisible(false);
+      setScreenMode('home');
+    }
+  };
+
+  const pickRecordingFile = async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ['audio/*', 'video/*'],
+        multiple: false,
+        copyToCacheDirectory: true,
+      });
+      if (result.canceled) {
+        return;
+      }
+      const asset = result.assets[0];
+      setUploadMode('file');
+      setUploadFileUri(asset.uri);
+      setUploadName(asset.name || `import-${Date.now()}`);
+      if (!uploadTargetFolderId) {
+        setUploadTargetFolderId(selectedSubjectId ?? subjects[0]?.id ?? null);
+      }
+    } catch (error) {
+      setStatusMessage(`파일 선택 실패: ${formatError(error)}`);
+    }
+  };
+
+  const saveUploadedRecording = async () => {
+    if (!uploadTargetFolderId) {
+      setStatusMessage('저장할 폴더를 선택해주세요.');
+      return;
+    }
+
+    try {
+      const targetPaths = getSubjectPaths(uploadTargetFolderId);
+      ensureRecordingDirs(targetPaths);
+
+      let targetName = '';
+      if (uploadMode === 'file') {
+        if (!uploadFileUri) {
+          setStatusMessage('업로드할 파일을 먼저 선택해주세요.');
+          return;
+        }
+        const source = new File(uploadFileUri);
+        if (!source.exists) {
+          throw new Error('선택한 파일을 읽을 수 없습니다.');
+        }
+        const sourceName = uploadName || source.name || `import-${Date.now()}.m4a`;
+        const extension = sourceName.match(/\.[^/.]+$/)?.[0] ?? '.m4a';
+        const base = sanitizeFileBaseName(stripAudioExtension(sourceName)) || `import-${Date.now()}`;
+        targetName = `${base}${extension}`;
+        const target = new File(targetPaths.recordingsDir, targetName);
+        if (target.exists) {
+          target.delete();
+        }
+        source.copy(target);
+      } else {
+        const link = uploadVideoLink.trim();
+        if (!link) {
+          setStatusMessage('영상 링크를 입력해주세요.');
+          return;
+        }
+        const base = sanitizeFileBaseName(uploadName) || `video-link-${Date.now()}`;
+        targetName = `${base}.url`;
+        const target = new File(targetPaths.recordingsDir, targetName);
+        writeText(target, link);
+      }
+
+      setUploadModalVisible(false);
+      setUploadFileUri('');
+      setUploadName('');
+      setUploadVideoLink('');
+      setUploadTargetFolderId(null);
+      setSelectedSubjectId(uploadTargetFolderId);
+      await loadSubjects(uploadTargetFolderId);
+      await loadSubjectFiles(uploadTargetFolderId, targetName);
+      setScreenMode('subject');
+      setStatusMessage(`파일 추가 완료: ${targetName}`);
+    } catch (error) {
+      setStatusMessage(`파일 추가 실패: ${formatError(error)}`);
     }
   };
 
   const runTranscriptionApi = async () => {
     if (!selectedSubject || !selectedRecording) {
       setStatusMessage('전사할 녹음 파일을 선택해주세요.');
+      return;
+    }
+    if (selectedRecording.recordingFile.name.toLowerCase().endsWith('.url')) {
+      setStatusMessage('영상 링크 파일은 현재 전사를 직접 지원하지 않습니다. 오디오 파일을 추가해주세요.');
       return;
     }
     if (!selectedRecording.recordingFile.exists) {
@@ -328,10 +853,9 @@ export default function App() {
 
     let uploadFile: File | null = null;
     let uploadUri = selectedRecording.recordingFile.uri;
-    const startedAt = Date.now();
     try {
       setIsBusy(true);
-      setStatusMessage('API 전사 중...');
+      setStatusMessage('API 전사 요청 중...');
       if (isRecording) {
         uploadFile = createRecordingSnapshot(selectedRecording.recordingFile);
         uploadUri = uploadFile.uri;
@@ -342,26 +866,68 @@ export default function App() {
         'file',
         {
           uri: uploadUri,
-          name: `recording-${Date.now()}.m4a`,
+          name: selectedRecording.recordingFile.name || `recording-${Date.now()}.m4a`,
           type: 'audio/m4a',
         } as any,
       );
+      formData.append('mode', 'api');
+      formData.append('file_name', selectedRecording.title);
+      if (expoPushToken) {
+        formData.append('expo_push_token', expoPushToken);
+      }
 
-      const response = await fetch(`${apiBaseUrl}/api/transcribe`, {
+      const response = await fetch(`${apiBaseUrl}/api/jobs/transcribe`, {
         method: 'POST',
         body: formData,
       });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data?.detail ?? '전사 실패');
+      const jobPayload = await readJsonSafely(response);
+      if (response.ok) {
+        const jobId = typeof jobPayload?.job_id === 'string' ? jobPayload.job_id : '';
+        if (!jobId) {
+          throw new Error('전사 잡 ID를 받지 못했습니다.');
+        }
+
+        addPendingJob({
+          jobId,
+          jobType: 'transcribe',
+          mode: 'api',
+          subjectId: selectedSubject.id,
+          recordingId: selectedRecording.id,
+          fileName: selectedRecording.title,
+        });
+        await notifyLocal('전사 시작', `${selectedRecording.title} 전사중`);
+        setStatusMessage(`전사 백그라운드 시작 (${selectedRecording.title})`);
+        return;
       }
 
-      const value = (data?.transcript ?? '').trim();
-      writeText(selectedRecording.transcriptFile, value);
-      setTranscript(value);
+      if (response.status !== 404) {
+        throw new Error(getApiErrorMessage(jobPayload, response, '전사 잡 생성 실패'));
+      }
+
+      const legacyForm = new FormData();
+      legacyForm.append(
+        'file',
+        {
+          uri: uploadUri,
+          name: selectedRecording.recordingFile.name || `recording-${Date.now()}.m4a`,
+          type: 'audio/m4a',
+        } as any,
+      );
+      const legacyResponse = await fetch(`${apiBaseUrl}/api/transcribe`, {
+        method: 'POST',
+        body: legacyForm,
+      });
+      const legacyPayload = await readJsonSafely(legacyResponse);
+      if (!legacyResponse.ok) {
+        throw new Error(getApiErrorMessage(legacyPayload, legacyResponse, '전사 실패'));
+      }
+
+      const transcriptValue = typeof legacyPayload?.transcript === 'string' ? legacyPayload.transcript.trim() : '';
+      writeText(selectedRecording.transcriptFile, transcriptValue);
+      setTranscript(transcriptValue);
       await refreshSelectedSubject(selectedRecording.id);
-      const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
-      setStatusMessage(`전사 저장 완료 (${elapsedSeconds}초)`);
+      await notifyLocal('전사 완료', `${selectedRecording.title} 전사가 완료되었습니다.`);
+      setStatusMessage(`전사 완료 (${selectedRecording.title})`);
     } catch (error) {
       setStatusMessage(`전사 실패: ${formatError(error)}`);
     } finally {
@@ -377,6 +943,10 @@ export default function App() {
       setStatusMessage('전사할 녹음 파일을 선택해주세요.');
       return;
     }
+    if (selectedRecording.recordingFile.name.toLowerCase().endsWith('.url')) {
+      setStatusMessage('영상 링크 파일은 현재 전사를 직접 지원하지 않습니다. 오디오 파일을 추가해주세요.');
+      return;
+    }
     if (!selectedRecording.recordingFile.exists) {
       setStatusMessage('선택한 녹음 파일이 없습니다.');
       return;
@@ -384,10 +954,9 @@ export default function App() {
 
     let uploadFile: File | null = null;
     let uploadUri = selectedRecording.recordingFile.uri;
-    const startedAt = Date.now();
     try {
       setIsBusy(true);
-      setStatusMessage('대화형 AI 전사 중...');
+      setStatusMessage('대화형 AI 전사 요청 중...');
       if (isRecording) {
         uploadFile = createRecordingSnapshot(selectedRecording.recordingFile);
         uploadUri = uploadFile.uri;
@@ -398,26 +967,68 @@ export default function App() {
         'file',
         {
           uri: uploadUri,
-          name: `recording-${Date.now()}.m4a`,
+          name: selectedRecording.recordingFile.name || `recording-${Date.now()}.m4a`,
           type: 'audio/m4a',
         } as any,
       );
+      formData.append('mode', 'chat');
+      formData.append('file_name', selectedRecording.title);
+      if (expoPushToken) {
+        formData.append('expo_push_token', expoPushToken);
+      }
 
-      const response = await fetch(`${apiBaseUrl}/api/transcribe-chat`, {
+      const response = await fetch(`${apiBaseUrl}/api/jobs/transcribe`, {
         method: 'POST',
         body: formData,
       });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data?.detail ?? '대화형 전사 실패');
+      const jobPayload = await readJsonSafely(response);
+      if (response.ok) {
+        const jobId = typeof jobPayload?.job_id === 'string' ? jobPayload.job_id : '';
+        if (!jobId) {
+          throw new Error('전사 잡 ID를 받지 못했습니다.');
+        }
+
+        addPendingJob({
+          jobId,
+          jobType: 'transcribe',
+          mode: 'chat',
+          subjectId: selectedSubject.id,
+          recordingId: selectedRecording.id,
+          fileName: selectedRecording.title,
+        });
+        await notifyLocal('전사 시작', `${selectedRecording.title} 전사중`);
+        setStatusMessage(`전사 백그라운드 시작 (${selectedRecording.title})`);
+        return;
       }
 
-      const value = (data?.transcript ?? '').trim();
-      writeText(selectedRecording.transcriptFile, value);
-      setTranscript(value);
+      if (response.status !== 404) {
+        throw new Error(getApiErrorMessage(jobPayload, response, '대화형 전사 잡 생성 실패'));
+      }
+
+      const legacyForm = new FormData();
+      legacyForm.append(
+        'file',
+        {
+          uri: uploadUri,
+          name: selectedRecording.recordingFile.name || `recording-${Date.now()}.m4a`,
+          type: 'audio/m4a',
+        } as any,
+      );
+      const legacyResponse = await fetch(`${apiBaseUrl}/api/transcribe-chat`, {
+        method: 'POST',
+        body: legacyForm,
+      });
+      const legacyPayload = await readJsonSafely(legacyResponse);
+      if (!legacyResponse.ok) {
+        throw new Error(getApiErrorMessage(legacyPayload, legacyResponse, '대화형 전사 실패'));
+      }
+
+      const transcriptValue = typeof legacyPayload?.transcript === 'string' ? legacyPayload.transcript.trim() : '';
+      writeText(selectedRecording.transcriptFile, transcriptValue);
+      setTranscript(transcriptValue);
       await refreshSelectedSubject(selectedRecording.id);
-      const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
-      setStatusMessage(`대화형 AI 전사 저장 완료 (${elapsedSeconds}초)`);
+      await notifyLocal('전사 완료', `${selectedRecording.title} 전사가 완료되었습니다.`);
+      setStatusMessage(`전사 완료 (${selectedRecording.title})`);
     } catch (error) {
       setStatusMessage(`대화형 전사 실패: ${formatError(error)}`);
     } finally {
@@ -442,23 +1053,58 @@ export default function App() {
 
     try {
       setIsBusy(true);
-      setStatusMessage('API 요약 중...');
+      setStatusMessage('API 요약 요청 중...');
 
-      const response = await fetch(`${apiBaseUrl}/api/summarize`, {
+      const response = await fetch(`${apiBaseUrl}/api/jobs/summarize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          transcript: sourceTranscript,
+          mode: 'api',
+          file_name: selectedRecording.title,
+          expo_push_token: expoPushToken || undefined,
+        }),
+      });
+      const jobPayload = await readJsonSafely(response);
+      if (response.ok) {
+        const jobId = typeof jobPayload?.job_id === 'string' ? jobPayload.job_id : '';
+        if (!jobId) {
+          throw new Error('요약 잡 ID를 받지 못했습니다.');
+        }
+
+        addPendingJob({
+          jobId,
+          jobType: 'summarize',
+          mode: 'api',
+          subjectId: selectedSubject.id,
+          recordingId: selectedRecording.id,
+          fileName: selectedRecording.title,
+        });
+        await notifyLocal('요약 시작', `${selectedRecording.title} 요약중`);
+        setStatusMessage(`요약 백그라운드 시작 (${selectedRecording.title})`);
+        return;
+      }
+
+      if (response.status !== 404) {
+        throw new Error(getApiErrorMessage(jobPayload, response, '요약 잡 생성 실패'));
+      }
+
+      const legacyResponse = await fetch(`${apiBaseUrl}/api/summarize`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ transcript: sourceTranscript }),
       });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data?.detail ?? '요약 실패');
+      const legacyPayload = await readJsonSafely(legacyResponse);
+      if (!legacyResponse.ok) {
+        throw new Error(getApiErrorMessage(legacyPayload, legacyResponse, '요약 실패'));
       }
 
-      const value = (data?.summary ?? '').trim();
-      writeText(selectedRecording.summaryFile, value);
-      setSummary(value);
+      const summaryValue = typeof legacyPayload?.summary === 'string' ? legacyPayload.summary.trim() : '';
+      writeText(selectedRecording.summaryFile, summaryValue);
+      setSummary(summaryValue);
       await refreshSelectedSubject(selectedRecording.id);
-      setStatusMessage('요약 저장 완료');
+      await notifyLocal('요약 완료', `${selectedRecording.title} 요약이 완료되었습니다.`);
+      setStatusMessage(`요약 완료 (${selectedRecording.title})`);
     } catch (error) {
       setStatusMessage(`요약 실패: ${formatError(error)}`);
     } finally {
@@ -480,23 +1126,58 @@ export default function App() {
 
     try {
       setIsBusy(true);
-      setStatusMessage('대화형 AI 요약 중...');
+      setStatusMessage('대화형 AI 요약 요청 중...');
 
-      const response = await fetch(`${apiBaseUrl}/api/summarize-chat`, {
+      const response = await fetch(`${apiBaseUrl}/api/jobs/summarize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          transcript: sourceTranscript,
+          mode: 'chat',
+          file_name: selectedRecording.title,
+          expo_push_token: expoPushToken || undefined,
+        }),
+      });
+      const jobPayload = await readJsonSafely(response);
+      if (response.ok) {
+        const jobId = typeof jobPayload?.job_id === 'string' ? jobPayload.job_id : '';
+        if (!jobId) {
+          throw new Error('요약 잡 ID를 받지 못했습니다.');
+        }
+
+        addPendingJob({
+          jobId,
+          jobType: 'summarize',
+          mode: 'chat',
+          subjectId: selectedSubject.id,
+          recordingId: selectedRecording.id,
+          fileName: selectedRecording.title,
+        });
+        await notifyLocal('요약 시작', `${selectedRecording.title} 요약중`);
+        setStatusMessage(`요약 백그라운드 시작 (${selectedRecording.title})`);
+        return;
+      }
+
+      if (response.status !== 404) {
+        throw new Error(getApiErrorMessage(jobPayload, response, '대화형 요약 잡 생성 실패'));
+      }
+
+      const legacyResponse = await fetch(`${apiBaseUrl}/api/summarize-chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ transcript: sourceTranscript }),
       });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data?.detail ?? '대화형 요약 실패');
+      const legacyPayload = await readJsonSafely(legacyResponse);
+      if (!legacyResponse.ok) {
+        throw new Error(getApiErrorMessage(legacyPayload, legacyResponse, '대화형 요약 실패'));
       }
 
-      const value = (data?.summary ?? '').trim();
-      writeText(selectedRecording.summaryFile, value);
-      setSummary(value);
+      const summaryValue = typeof legacyPayload?.summary === 'string' ? legacyPayload.summary.trim() : '';
+      writeText(selectedRecording.summaryFile, summaryValue);
+      setSummary(summaryValue);
       await refreshSelectedSubject(selectedRecording.id);
-      setStatusMessage('대화형 AI 요약 저장 완료');
+      await notifyLocal('요약 완료', `${selectedRecording.title} 요약이 완료되었습니다.`);
+      setStatusMessage(`요약 완료 (${selectedRecording.title})`);
     } catch (error) {
       setStatusMessage(`대화형 요약 실패: ${formatError(error)}`);
     } finally {
@@ -512,69 +1193,217 @@ export default function App() {
     await loadSubjects(selectedSubjectId);
   };
 
-  const syncSubjectToLibrary = async () => {
-    if (!selectedSubject || !selectedRecording) {
-      setStatusMessage('과목을 선택해주세요.');
-      return;
+  const postLibrarySync = async (formData: FormData) => {
+    const response = await fetch(`${apiBaseUrl}/api/library/sync`, {
+      method: 'POST',
+      body: formData,
+    });
+    const payload = await readJsonSafely(response);
+    if (!response.ok) {
+      throw new Error(getApiErrorMessage(payload, response, '서버 동기화 실패'));
     }
+    return payload;
+  };
 
+  const uploadAllFoldersToCloud = async () => {
     try {
       setIsBusy(true);
-      setStatusMessage('PC 라이브러리 동기화 중...');
+      setStatusMessage('서버 업로드 시작...');
+      ensureSubjectsRoot();
 
-      const formData = new FormData();
-      formData.append('subject_id', selectedSubject.id);
-      formData.append('subject_name', selectedSubject.name);
-      formData.append('subject_tag', selectedSubject.tag);
-
-      const selectedBaseName = recordingDisplayName(selectedRecording);
-      const hasRecording = appendFileIfExists(
-        formData,
-        'recording',
-        selectedRecording.recordingFile,
-        selectedBaseName,
-        'audio/m4a',
-      );
-      const hasTranscript = appendFileIfExists(
-        formData,
-        'transcript',
-        selectedRecording.transcriptFile,
-        `${stripAudioExtension(selectedBaseName)}.txt`,
-        'text/plain',
-      );
-      const hasSummary = appendFileIfExists(
-        formData,
-        'summary',
-        selectedRecording.summaryFile,
-        `${stripAudioExtension(selectedBaseName)}.summary.txt`,
-        'text/plain',
-      );
-      const hasAnyFile = hasRecording || hasTranscript || hasSummary;
-
-      if (!hasAnyFile) {
-        setStatusMessage('동기화할 파일이 없습니다.');
+      const dirs = SUBJECTS_ROOT.list().filter((entry): entry is Directory => entry instanceof Directory);
+      if (dirs.length === 0) {
+        setStatusMessage('업로드할 폴더가 없습니다.');
         return;
       }
 
-      const response = await fetch(`${apiBaseUrl}/api/library/sync`, {
-        method: 'POST',
-        body: formData,
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data?.detail ?? '라이브러리 동기화 실패');
+      let uploadUnits = 0;
+      for (const dir of dirs) {
+        const subjectId = dir.name;
+        const paths = getSubjectPaths(subjectId);
+        const meta = await readMeta(paths.meta);
+        const subjectName = meta?.name ?? subjectId;
+        const subjectTag = meta?.tag ?? 'major';
+        const subjectIcon = meta?.icon ?? DEFAULT_FOLDER_ICON;
+        const subjectColor = meta?.color ?? DEFAULT_FOLDER_COLOR;
+
+        const metaForm = new FormData();
+        metaForm.append('subject_id', subjectId);
+        metaForm.append('subject_name', subjectName);
+        metaForm.append('subject_tag', subjectTag);
+        metaForm.append('subject_icon', subjectIcon);
+        metaForm.append('subject_color', subjectColor);
+        await postLibrarySync(metaForm);
+
+        const items = listRecordingItems(paths);
+        for (const item of items) {
+          const recordingName = item.recordingFile.name || item.title;
+          const unitForm = new FormData();
+          unitForm.append('subject_id', subjectId);
+          unitForm.append('subject_name', subjectName);
+          unitForm.append('subject_tag', subjectTag);
+          unitForm.append('subject_icon', subjectIcon);
+          unitForm.append('subject_color', subjectColor);
+
+          let hasAny = false;
+          if (item.recordingFile.exists) {
+            unitForm.append('recording_name', recordingName);
+            unitForm.append(
+              'recording',
+              {
+                uri: item.recordingFile.uri,
+                name: recordingName,
+                type: recordingMimeType(recordingName),
+              } as any,
+            );
+            hasAny = true;
+          }
+          if (item.transcriptFile.exists) {
+            const transcriptName = item.transcriptFile.name || `${stripAudioExtension(recordingName)}.txt`;
+            unitForm.append('transcript_name', transcriptName);
+            unitForm.append(
+              'transcript',
+              {
+                uri: item.transcriptFile.uri,
+                name: transcriptName,
+                type: 'text/plain',
+              } as any,
+            );
+            hasAny = true;
+          }
+          if (item.summaryFile.exists) {
+            const summaryName = item.summaryFile.name || `${stripAudioExtension(recordingName)}.txt`;
+            unitForm.append('summary_name', summaryName);
+            unitForm.append(
+              'summary',
+              {
+                uri: item.summaryFile.uri,
+                name: summaryName,
+                type: 'text/plain',
+              } as any,
+            );
+            hasAny = true;
+          }
+
+          if (!hasAny) {
+            continue;
+          }
+          await postLibrarySync(unitForm);
+          uploadUnits += 1;
+        }
       }
 
-      const targetPath = typeof data?.target_dir === 'string' ? data.target_dir : '';
-      const savedFiles = Array.isArray(data?.saved_files)
-        ? data.saved_files.filter((value: unknown): value is string => typeof value === 'string')
-        : [];
-
-      setLibraryPath(targetPath);
-      setLibrarySavedFiles(savedFiles);
-      setStatusMessage(`PC 라이브러리 동기화 완료 (${savedFiles.join(', ') || 'meta.json'})`);
+      setStatusMessage(`서버 업로드 완료 (파일 세트 ${uploadUnits}개)`);
     } catch (error) {
-      setStatusMessage(`라이브러리 동기화 실패: ${formatError(error)}`);
+      setStatusMessage(`서버 업로드 실패: ${formatError(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const restoreAllFoldersFromCloud = async () => {
+    try {
+      setIsBusy(true);
+      setStatusMessage('서버 복원 시작...');
+
+      const response = await fetch(`${apiBaseUrl}/api/library`);
+      const payload = await readJsonSafely(response);
+      if (!response.ok) {
+        throw new Error(getApiErrorMessage(payload, response, '서버 목록 조회 실패'));
+      }
+
+      const cloudSubjects = Array.isArray(payload?.subjects)
+        ? payload.subjects.filter((item: unknown) => typeof item === 'object' && item !== null)
+        : [];
+      if (cloudSubjects.length === 0) {
+        setStatusMessage('서버에 저장된 폴더가 없습니다.');
+        return;
+      }
+
+      let downloadedFiles = 0;
+      let firstSubjectId: string | null = null;
+      ensureSubjectsRoot();
+
+      for (const entry of cloudSubjects as any[]) {
+        const subjectId = String(entry.subject_id ?? '').trim();
+        if (!subjectId) {
+          continue;
+        }
+        if (!firstSubjectId) {
+          firstSubjectId = subjectId;
+        }
+
+        const subjectName = String(entry.subject_name ?? subjectId);
+        const subjectTag = normalizeSubjectTag(String(entry.subject_tag ?? 'major'));
+        const subjectIcon = String(entry.subject_icon ?? DEFAULT_FOLDER_ICON) || DEFAULT_FOLDER_ICON;
+        const subjectColor = normalizeFolderColor(String(entry.subject_color ?? DEFAULT_FOLDER_COLOR));
+
+        const paths = getSubjectPaths(subjectId);
+        paths.dir.create({ idempotent: true, intermediates: true });
+        ensureRecordingDirs(paths);
+        const meta: SubjectMeta = {
+          id: subjectId,
+          name: subjectName,
+          tag: subjectTag,
+          icon: subjectIcon,
+          color: subjectColor,
+          createdAt: Date.now(),
+        };
+        writeText(paths.meta, JSON.stringify(meta, null, 2));
+
+        const recordings = Array.isArray(entry.recordings)
+          ? entry.recordings.filter((value: unknown): value is string => typeof value === 'string')
+          : [];
+        const transcripts = Array.isArray(entry.transcripts)
+          ? entry.transcripts.filter((value: unknown): value is string => typeof value === 'string')
+          : [];
+        const summaries = Array.isArray(entry.summaries)
+          ? entry.summaries.filter((value: unknown): value is string => typeof value === 'string')
+          : [];
+
+        for (const name of recordings) {
+          const target = new File(paths.recordingsDir, name);
+          if (target.exists) {
+            target.delete();
+          }
+          await File.downloadFileAsync(
+            `${apiBaseUrl}/api/library/file?subject_id=${encodeURIComponent(subjectId)}&kind=recording&name=${encodeURIComponent(name)}`,
+            target,
+          );
+          downloadedFiles += 1;
+        }
+        for (const name of transcripts) {
+          const target = new File(paths.transcriptsDir, name);
+          if (target.exists) {
+            target.delete();
+          }
+          await File.downloadFileAsync(
+            `${apiBaseUrl}/api/library/file?subject_id=${encodeURIComponent(subjectId)}&kind=transcript&name=${encodeURIComponent(name)}`,
+            target,
+          );
+          downloadedFiles += 1;
+        }
+        for (const name of summaries) {
+          const target = new File(paths.summariesDir, name);
+          if (target.exists) {
+            target.delete();
+          }
+          await File.downloadFileAsync(
+            `${apiBaseUrl}/api/library/file?subject_id=${encodeURIComponent(subjectId)}&kind=summary&name=${encodeURIComponent(name)}`,
+            target,
+          );
+          downloadedFiles += 1;
+        }
+      }
+
+      await loadSubjects(firstSubjectId ?? undefined);
+      if (firstSubjectId) {
+        await loadSubjectFiles(firstSubjectId);
+      }
+      setScreenMode('home');
+      setStatusMessage(`서버 복원 완료 (파일 ${downloadedFiles}개)`);
+    } catch (error) {
+      setStatusMessage(`서버 복원 실패: ${formatError(error)}`);
     } finally {
       setIsBusy(false);
     }
@@ -637,10 +1466,13 @@ export default function App() {
         id,
         name: meta?.name ?? id,
         tag: meta?.tag ?? 'major',
+        icon: meta?.icon ?? DEFAULT_FOLDER_ICON,
+        color: normalizeFolderColor(meta?.color ?? DEFAULT_FOLDER_COLOR),
         hasRecording,
         hasTranscript,
         hasSummary,
         updatedAt,
+        previewFiles: recordings.slice(0, 3).map((item) => item.title),
       });
     }
 
@@ -690,250 +1522,494 @@ export default function App() {
       <SafeAreaView style={styles.safeArea}>
         <ScrollView contentContainerStyle={styles.content}>
           <Text style={styles.title}>Campus Lecture Binder</Text>
-          <Text style={styles.subtitle}>수업별 디렉토리로 녹음 · 전사 · 요약 관리</Text>
+          <Text style={styles.subtitle}>폴더 → 파일 → 전사/요약 상세</Text>
 
-          <View style={styles.card}>
-            <Text style={styles.sectionTitle}>1) 디렉토리 만들기/열기</Text>
-            <View style={styles.row}>
-              <TextInput
-                placeholder="예: 선형대수"
-                placeholderTextColor="#94A3B8"
-                style={styles.input}
-                value={newSubjectName}
-                onChangeText={setNewSubjectName}
-              />
-              <Pressable style={styles.smallButton} onPress={createSubject}>
-                <Text style={styles.smallButtonText}>디렉토리 만들기</Text>
-              </Pressable>
-            </View>
-            <View style={styles.tagSelectWrap}>
-              <Text style={styles.tagSelectLabel}>태그 선택</Text>
-              <View style={styles.tagSelectRow}>
-                {(Object.keys(SUBJECT_TAG_STYLES) as SubjectTag[]).map((tag) => {
-                  const tagStyle = SUBJECT_TAG_STYLES[tag];
-                  const active = newSubjectTag === tag;
-                  return (
-                    <Pressable
-                      key={tag}
-                      style={[
-                        styles.tagOptionButton,
-                        { backgroundColor: tagStyle.bg, borderColor: tagStyle.border },
-                        active && styles.tagOptionButtonActive,
-                      ]}
-                      onPress={() => setNewSubjectTag(tag)}
-                    >
-                      <Text style={[styles.tagOptionText, { color: tagStyle.text }]}>
-                        {tagStyle.icon} {tagStyle.label}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
+          {screenMode === 'home' ? (
+            <View style={styles.card}>
+              <Text style={styles.sectionTitle}>폴더 목록</Text>
+              <Text style={styles.helper}>아래 폴더 박스를 누르면 내부 녹음 파일 목록이 열립니다.</Text>
+              <View style={styles.cloudSyncRow}>
+                <Pressable
+                  style={[styles.cloudSyncButton, isBusy && styles.disabledButton]}
+                  onPress={uploadAllFoldersToCloud}
+                  disabled={isBusy}
+                >
+                  <Text style={styles.cloudSyncButtonText}>서버 업로드</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.cloudSyncButton, isBusy && styles.disabledButton]}
+                  onPress={restoreAllFoldersFromCloud}
+                  disabled={isBusy}
+                >
+                  <Text style={styles.cloudSyncButtonText}>서버에서 복원</Text>
+                </Pressable>
               </View>
-            </View>
-            <Text style={styles.helper}>목록에서 '디렉토리 열기'를 누르면 해당 수업으로 이동합니다.</Text>
-            <View style={styles.subjectList}>
-              {subjects.length === 0 ? <Text style={styles.helper}>생성된 과목이 없습니다.</Text> : null}
-              {subjects.map((subject) => (
-                <View key={subject.id} style={styles.subjectRow}>
+              <View style={styles.subjectList}>
+                {subjects.length === 0 ? <Text style={styles.helper}>저장된 폴더가 없습니다.</Text> : null}
+                {subjects.map((subject) => (
                   <Pressable
-                    style={[styles.subjectItem, selectedSubjectId === subject.id && styles.subjectItemActive]}
+                    key={subject.id}
+                    style={[styles.subjectItem, { borderColor: subject.color }]}
                     onPress={() => openDirectory(subject.id)}
                   >
-                    <Text style={styles.subjectName}>{subject.name}</Text>
-                    <View
-                      style={[
-                        styles.tagBadge,
-                        {
-                          backgroundColor: SUBJECT_TAG_STYLES[subject.tag].bg,
-                          borderColor: SUBJECT_TAG_STYLES[subject.tag].border,
-                        },
-                      ]}
-                    >
-                      <Text style={[styles.tagBadgeText, { color: SUBJECT_TAG_STYLES[subject.tag].text }]}>
-                        {SUBJECT_TAG_STYLES[subject.tag].icon} {SUBJECT_TAG_STYLES[subject.tag].label}
-                      </Text>
+                    <View style={styles.subjectHeaderRow}>
+                      <View style={[styles.folderIconBubble, { backgroundColor: subject.color }]}>
+                        <Text style={styles.folderIconText}>{subject.icon}</Text>
+                      </View>
+                      <Text style={styles.subjectName}>{subject.name}</Text>
                     </View>
                     <Text style={styles.subjectMeta}>
                       {subject.hasRecording ? 'REC' : '-'} / {subject.hasTranscript ? 'TXT' : '-'} /{' '}
                       {subject.hasSummary ? 'SUM' : '-'}
                     </Text>
+                    {subject.previewFiles.length > 0 ? (
+                      <View style={styles.previewFileList}>
+                        {subject.previewFiles.map((fileName) => (
+                          <Text key={`${subject.id}-${fileName}`} style={styles.previewFileItem}>
+                            · {fileName}
+                          </Text>
+                        ))}
+                      </View>
+                    ) : (
+                      <Text style={styles.previewFileItem}>· 파일 없음</Text>
+                    )}
                   </Pressable>
-                  <Pressable style={styles.openButton} onPress={() => openDirectory(subject.id)}>
-                    <Text style={styles.openButtonText}>디렉토리 열기</Text>
+                ))}
+              </View>
+            </View>
+          ) : null}
+
+          {screenMode === 'subject' ? (
+            <View style={styles.card}>
+              <View style={styles.topRow}>
+                <Pressable style={styles.openButton} onPress={() => setScreenMode('home')}>
+                  <Text style={styles.openButtonText}>홈으로</Text>
+                </Pressable>
+                <Text style={styles.sectionTitleInline}>폴더: {selectedSubject?.name ?? '없음'}</Text>
+              </View>
+              <Text style={styles.helper}>파일 박스를 누르면 상세 창이 열립니다.</Text>
+              <View style={styles.recordingList}>
+                {recordings.length === 0 ? <Text style={styles.helper}>저장된 녹음 파일이 없습니다.</Text> : null}
+                {recordings.map((item) => (
+                  <Pressable key={item.id} style={styles.recordingItem} onPress={() => void selectRecording(item.id)}>
+                    <Text style={styles.recordingTitle}>{item.title}</Text>
+                    <Text style={styles.recordingMeta}>
+                      {item.recordingFile.exists ? 'REC' : '-'} / {item.transcriptFile.exists ? 'TXT' : '-'} /{' '}
+                      {item.summaryFile.exists ? 'SUM' : '-'}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+          ) : null}
+
+          {screenMode === 'record' ? (
+            <View style={styles.card}>
+              <View style={styles.topRow}>
+                <Pressable style={styles.openButton} onPress={() => setScreenMode('home')}>
+                  <Text style={styles.openButtonText}>홈으로</Text>
+                </Pressable>
+                <Text style={styles.sectionTitleInline}>새 녹음</Text>
+              </View>
+              <Text style={styles.recordTimer}>{displayTime}</Text>
+              <Text style={styles.helper}>
+                {isRecording ? '녹음 중입니다. 백그라운드에서도 계속 녹음됩니다.' : '시작 버튼으로 녹음을 시작하세요.'}
+              </Text>
+              {!isRecording ? (
+                <Pressable style={[styles.actionButton, isBusy && styles.disabledButton]} onPress={startRecording} disabled={isBusy}>
+                  <Text style={styles.actionButtonText}>녹음 시작</Text>
+                </Pressable>
+              ) : (
+                <Pressable style={[styles.deleteButton, isBusy && styles.disabledButton]} onPress={stopRecording} disabled={isBusy}>
+                  <Text style={styles.deleteButtonText}>녹음 중지</Text>
+                </Pressable>
+              )}
+              {recordingDraftUri ? (
+                <Text style={styles.helper}>녹음이 완료되었습니다. 저장 정보를 입력해주세요.</Text>
+              ) : null}
+            </View>
+          ) : null}
+
+          {screenMode === 'detail' ? (
+            <>
+              <View style={styles.card}>
+                <View style={styles.topRow}>
+                  <Pressable style={styles.openButton} onPress={() => setScreenMode('subject')}>
+                    <Text style={styles.openButtonText}>파일 목록</Text>
+                  </Pressable>
+                  <Text style={styles.sectionTitleInline}>상세: {selectedRecording?.title ?? '없음'}</Text>
+                </View>
+                <Text style={styles.helper}>선택 파일 크기: {formatBytes(selectedRecording?.recordingFile.size ?? 0)}</Text>
+                <Text style={styles.filePath} numberOfLines={1}>
+                  녹음 파일: {recordingUri ?? '없음'}
+                </Text>
+                <Pressable
+                  style={[styles.renameButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                  onPress={openRenameModal}
+                  disabled={!selectedRecording || isBusy}
+                >
+                  <Text style={styles.renameButtonText}>파일 이름 변경</Text>
+                </Pressable>
+              </View>
+
+              <View style={styles.card}>
+                <Text style={styles.sectionTitle}>전사 방식 선택</Text>
+                <ModeToggle mode={transcribeMode} onChange={setTranscribeMode} />
+                {transcribeMode === 'chat' ? (
+                  <Pressable
+                    style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                    onPress={runTranscriptionChatApi}
+                    disabled={!selectedRecording || isBusy}
+                  >
+                    <Text style={styles.actionButtonText}>대화형 AI 전사 실행</Text>
+                  </Pressable>
+                ) : (
+                  <Pressable
+                    style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                    onPress={runTranscriptionApi}
+                    disabled={!selectedRecording || isBusy}
+                  >
+                    <Text style={styles.actionButtonText}>API 전사 실행</Text>
+                  </Pressable>
+                )}
+                <View style={styles.previewRow}>
+                  <Text style={styles.previewTitle}>전사 내용 (최대 10줄)</Text>
+                  <Pressable style={styles.editChip} onPress={openTranscriptEditor}>
+                    <Text style={styles.editChipText}>편집 +</Text>
                   </Pressable>
                 </View>
-              ))}
-            </View>
-          </View>
+                <Text style={styles.bodyText}>{toTenLinePreview(transcript, '전사 결과 없음')}</Text>
+              </View>
 
-          <View style={styles.card}>
-            <Text style={styles.sectionTitle}>2) 선택 과목 녹음/저장</Text>
-            <Text style={styles.helper}>선택 과목: {selectedSubject?.name ?? '없음'}</Text>
-            {selectedSubject ? (
-              <View
-                style={[
-                  styles.selectedTagBadge,
-                  {
-                    backgroundColor: SUBJECT_TAG_STYLES[selectedSubject.tag].bg,
-                    borderColor: SUBJECT_TAG_STYLES[selectedSubject.tag].border,
-                  },
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.selectedTagBadgeText,
-                    {
-                      color: SUBJECT_TAG_STYLES[selectedSubject.tag].text,
-                    },
-                  ]}
+              <View style={styles.card}>
+                <Text style={styles.sectionTitle}>요약 방식 선택</Text>
+                <ModeToggle mode={summaryMode} onChange={setSummaryMode} />
+                {summaryMode === 'chat' ? (
+                  <Pressable
+                    style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                    onPress={runSummaryChatApi}
+                    disabled={!selectedRecording || isBusy}
+                  >
+                    <Text style={styles.actionButtonText}>대화형 AI 요약 실행</Text>
+                  </Pressable>
+                ) : (
+                  <Pressable
+                    style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                    onPress={runSummaryApi}
+                    disabled={!selectedRecording || isBusy}
+                  >
+                    <Text style={styles.actionButtonText}>API 요약 실행</Text>
+                  </Pressable>
+                )}
+                <View style={styles.previewRow}>
+                  <Text style={styles.previewTitle}>요약 내용 (최대 10줄)</Text>
+                  <Pressable style={styles.editChip} onPress={openSummaryEditor}>
+                    <Text style={styles.editChipText}>편집 +</Text>
+                  </Pressable>
+                </View>
+                <Text style={styles.bodyText}>{toTenLinePreview(summary, '요약 결과 없음')}</Text>
+              </View>
+
+              <View style={styles.card}>
+                <Text style={styles.status}>상태: {statusMessage}</Text>
+                <Text style={styles.apiInfo}>API: {apiBaseUrl}</Text>
+                {pendingJobs.length > 0 ? (
+                  <Text style={styles.pendingInfo}>
+                    진행중 잡: {pendingJobs.map((job) => `${job.fileName} ${job.jobType === 'transcribe' ? '전사' : '요약'}`).join(', ')}
+                  </Text>
+                ) : null}
+                {isBusy ? <ActivityIndicator color="#2563EB" style={styles.loader} /> : null}
+                <Pressable
+                  style={[styles.deleteButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                  onPress={deleteCurrentRecording}
+                  disabled={!selectedRecording || isBusy}
                 >
-                  {SUBJECT_TAG_STYLES[selectedSubject.tag].icon} {SUBJECT_TAG_STYLES[selectedSubject.tag].label}
-                </Text>
+                  <Text style={styles.deleteButtonText}>삭제</Text>
+                </Pressable>
+              </View>
+            </>
+          ) : null}
+        </ScrollView>
+
+        {screenMode === 'home' ? (
+          <View style={styles.fabContainer} pointerEvents="box-none">
+            {fabOpen ? (
+              <View style={styles.fabMenu}>
+                <Pressable
+                  style={styles.fabMenuItem}
+                  onPress={() => {
+                    setFabOpen(false);
+                    setScreenMode('record');
+                    setStatusMessage('새 녹음을 시작합니다.');
+                  }}
+                >
+                  <Text style={styles.fabMenuText}>새 녹음</Text>
+                </Pressable>
+                <Pressable
+                  style={styles.fabMenuItem}
+                  onPress={() => {
+                    setFabOpen(false);
+                    setNewFolderName('');
+                    setNewFolderIcon(DEFAULT_FOLDER_ICON);
+                    setNewFolderColor(DEFAULT_FOLDER_COLOR);
+                    setFolderModalVisible(true);
+                  }}
+                >
+                  <Text style={styles.fabMenuText}>새 폴더 추가</Text>
+                </Pressable>
+                <Pressable
+                  style={styles.fabMenuItem}
+                  onPress={() => {
+                    setFabOpen(false);
+                    setUploadMode('file');
+                    setUploadFileUri('');
+                    setUploadName('');
+                    setUploadVideoLink('');
+                    setUploadTargetFolderId(selectedSubjectId ?? subjects[0]?.id ?? null);
+                    setUploadModalVisible(true);
+                  }}
+                >
+                  <Text style={styles.fabMenuText}>녹음 파일 추가</Text>
+                </Pressable>
               </View>
             ) : null}
-            <Text style={styles.timer}>{displayTime}</Text>
-            <Pressable
-              style={[
-                styles.recordButton,
-                isRecording ? styles.stopButton : styles.startButton,
-                recordButtonDisabled && styles.disabledButton,
-              ]}
-              onPress={isRecording ? stopRecording : startRecording}
-              disabled={recordButtonDisabled}
-            >
-              <Text style={styles.recordButtonText}>
-                {isRecording ? '녹음 중지 및 저장' : selectedSubject ? '녹음 시작' : '디렉토리 먼저 열기'}
-              </Text>
+            <Pressable style={styles.fabButton} onPress={() => setFabOpen((prev) => !prev)}>
+              <Text style={styles.fabButtonText}>{fabOpen ? '×' : '+'}</Text>
             </Pressable>
-            <Text style={styles.helper}>백그라운드 녹음은 Dev Build/Release 환경에서 더 안정적입니다.</Text>
-            {!selectedSubject ? (
-              <Text style={styles.warnText}>녹음을 시작하려면 먼저 과목 디렉토리를 열어주세요.</Text>
-            ) : null}
-            <Text style={styles.helper}>녹음 파일 선택: {selectedRecording?.title ?? '없음'}</Text>
-            <Text style={styles.helper}>
-              선택 파일 크기: {formatBytes(selectedRecording?.recordingFile.size ?? 0)}
-            </Text>
-            <Text style={styles.filePath} numberOfLines={1}>
-              녹음 파일: {recordingUri ?? '없음'}
-            </Text>
-            <View style={styles.recordingList}>
-              {recordings.length === 0 ? <Text style={styles.helper}>저장된 녹음 파일이 없습니다.</Text> : null}
-              {recordings.map((item) => (
+          </View>
+        ) : null}
+      </SafeAreaView>
+
+      <Modal visible={editorVisible} transparent animationType="slide" onRequestClose={() => setEditorVisible(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>{editorTarget === 'summary' ? '요약 전체 편집' : '전사 전체 편집'}</Text>
+            <TextInput
+              value={editorText}
+              onChangeText={setEditorText}
+              multiline
+              style={styles.modalInput}
+              placeholder="내용을 입력하세요"
+              placeholderTextColor="#94A3B8"
+            />
+            <View style={styles.modalActions}>
+              <Pressable style={[styles.modalButton, styles.modalCancel]} onPress={() => setEditorVisible(false)}>
+                <Text style={styles.modalButtonText}>취소</Text>
+              </Pressable>
+              <Pressable style={[styles.modalButton, styles.modalSave]} onPress={() => void saveEditedText()}>
+                <Text style={styles.modalButtonText}>저장</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={renameVisible} transparent animationType="fade" onRequestClose={() => setRenameVisible(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>파일 이름 변경</Text>
+            <TextInput
+              value={renameText}
+              onChangeText={setRenameText}
+              style={styles.renameInput}
+              placeholder="예: 선형대수_1주차"
+              placeholderTextColor="#94A3B8"
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <Text style={styles.helper}>녹음/전사/요약 파일명이 함께 변경됩니다.</Text>
+            <View style={styles.modalActions}>
+              <Pressable style={[styles.modalButton, styles.modalCancel]} onPress={() => setRenameVisible(false)}>
+                <Text style={styles.modalButtonText}>취소</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.modalButton, styles.modalSave, isBusy && styles.disabledButton]}
+                onPress={() => void renameCurrentRecording()}
+                disabled={isBusy}
+              >
+                <Text style={styles.modalButtonText}>변경</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={folderModalVisible} transparent animationType="fade" onRequestClose={() => setFolderModalVisible(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>새 폴더 추가</Text>
+            <TextInput
+              value={newFolderName}
+              onChangeText={setNewFolderName}
+              style={styles.renameInput}
+              placeholder="폴더 이름"
+              placeholderTextColor="#94A3B8"
+            />
+            <Text style={styles.modalLabel}>아이콘</Text>
+            <TextInput
+              value={newFolderIcon}
+              onChangeText={(value) => setNewFolderIcon(value || DEFAULT_FOLDER_ICON)}
+              style={styles.renameInput}
+              placeholder="예: 📁"
+              placeholderTextColor="#94A3B8"
+              maxLength={2}
+            />
+            <View style={styles.optionWrap}>
+              {FOLDER_ICON_OPTIONS.map((icon) => (
                 <Pressable
-                  key={item.id}
-                  style={[styles.recordingItem, selectedRecordingId === item.id && styles.recordingItemActive]}
-                  onPress={() => void selectRecording(item.id)}
+                  key={icon}
+                  style={[styles.optionChip, newFolderIcon === icon && styles.optionChipActive]}
+                  onPress={() => setNewFolderIcon(icon)}
                 >
-                  <Text style={styles.recordingTitle}>{item.title}</Text>
-                  <Text style={styles.recordingMeta}>
-                    {item.recordingFile.exists ? 'REC' : '-'} / {item.transcriptFile.exists ? 'TXT' : '-'} /{' '}
-                    {item.summaryFile.exists ? 'SUM' : '-'}
+                  <Text style={styles.optionChipText}>{icon}</Text>
+                </Pressable>
+              ))}
+            </View>
+            <Text style={styles.modalLabel}>색상</Text>
+            <TextInput
+              value={newFolderColor}
+              onChangeText={(value) => setNewFolderColor(value || DEFAULT_FOLDER_COLOR)}
+              style={styles.renameInput}
+              placeholder="#DBEAFE"
+              placeholderTextColor="#94A3B8"
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <View style={styles.optionWrap}>
+              {FOLDER_COLOR_OPTIONS.map((color) => (
+                <Pressable
+                  key={color}
+                  style={[styles.colorChip, { backgroundColor: color }, newFolderColor === color && styles.colorChipActive]}
+                  onPress={() => setNewFolderColor(color)}
+                />
+              ))}
+            </View>
+            <View style={styles.modalActions}>
+              <Pressable style={[styles.modalButton, styles.modalCancel]} onPress={() => setFolderModalVisible(false)}>
+                <Text style={styles.modalButtonText}>취소</Text>
+              </Pressable>
+              <Pressable style={[styles.modalButton, styles.modalSave]} onPress={() => void createSubject()}>
+                <Text style={styles.modalButtonText}>생성</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={recordingSaveVisible} transparent animationType="fade" onRequestClose={cancelRecordingSave}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>녹음 저장</Text>
+            <TextInput
+              value={recordingSaveName}
+              onChangeText={setRecordingSaveName}
+              style={styles.renameInput}
+              placeholder="파일 이름"
+              placeholderTextColor="#94A3B8"
+            />
+            <Text style={styles.modalLabel}>저장 폴더</Text>
+            <View style={styles.folderPickerList}>
+              {subjects.map((subject) => (
+                <Pressable
+                  key={`save-${subject.id}`}
+                  style={[
+                    styles.folderPickerItem,
+                    recordingTargetFolderId === subject.id && styles.folderPickerItemActive,
+                  ]}
+                  onPress={() => setRecordingTargetFolderId(subject.id)}
+                >
+                  <Text style={styles.folderPickerText}>
+                    {subject.icon} {subject.name}
                   </Text>
                 </Pressable>
               ))}
             </View>
-          </View>
-
-          <View style={styles.card}>
-            <Text style={styles.sectionTitle}>3) 전사 방식 선택</Text>
-            <ModeToggle mode={transcribeMode} onChange={setTranscribeMode} />
-            {transcribeMode === 'api' ? (
-              <Pressable
-                style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
-                onPress={runTranscriptionApi}
-                disabled={!selectedRecording || isBusy}
-              >
-                <Text style={styles.actionButtonText}>API 전사 실행</Text>
+            <View style={styles.modalActions}>
+              <Pressable style={[styles.modalButton, styles.modalCancel]} onPress={cancelRecordingSave}>
+                <Text style={styles.modalButtonText}>취소(임시저장)</Text>
               </Pressable>
-            ) : (
-              <Pressable
-                style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
-                onPress={runTranscriptionChatApi}
-                disabled={!selectedRecording || isBusy}
-              >
-                <Text style={styles.actionButtonText}>대화형 AI 전사 실행</Text>
-              </Pressable>
-            )}
-            <Text style={styles.previewTitle}>전사 미리보기</Text>
-            <Text style={styles.bodyText}>{transcript || '전사 결과 없음'}</Text>
-          </View>
-
-          <View style={styles.card}>
-            <Text style={styles.sectionTitle}>4) 요약 방식 선택</Text>
-            <ModeToggle mode={summaryMode} onChange={setSummaryMode} />
-            {summaryMode === 'api' ? (
-              <Pressable
-                style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
-                onPress={runSummaryApi}
-                disabled={!selectedRecording || isBusy}
-              >
-                <Text style={styles.actionButtonText}>API 요약 실행</Text>
-              </Pressable>
-            ) : (
-              <Pressable
-                style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
-                onPress={runSummaryChatApi}
-                disabled={!selectedRecording || isBusy}
-              >
-                <Text style={styles.actionButtonText}>대화형 AI 요약 실행</Text>
-              </Pressable>
-            )}
-            <Text style={styles.previewTitle}>요약 미리보기</Text>
-            <Text style={styles.bodyText}>{summary || '요약 결과 없음'}</Text>
-          </View>
-
-          <View style={styles.card}>
-            <Text style={styles.sectionTitle}>5) 저장 상태</Text>
-            <Text style={styles.helper}>각 과목 폴더의 recordings/transcripts/summaries에 파일별로 저장됩니다.</Text>
-            <Pressable
-              style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
-              onPress={syncSubjectToLibrary}
-              disabled={!selectedRecording || isBusy}
-            >
-              <Text style={styles.actionButtonText}>PC 라이브러리 동기화</Text>
-            </Pressable>
-            <Text style={styles.helper}>선택 파일: {selectedRecording?.title ?? '없음'}</Text>
-            <Text style={styles.filePath} numberOfLines={1}>
-              PC 라이브러리 경로: {libraryPath || '미동기화'}
-            </Text>
-            {librarySavedFiles.length > 0 ? (
-              <Text style={styles.helper}>동기화 파일: {librarySavedFiles.join(', ')}</Text>
-            ) : null}
-            <Text style={styles.filePath} numberOfLines={1}>
-              폴더: {selectedPaths?.dir.uri ?? '과목 미선택'}
-            </Text>
-            <View style={styles.fileActionGrid}>
-              <Pressable
-                style={[styles.fileActionButton, (!selectedRecording?.recordingFile.exists || isBusy) && styles.disabledButton]}
-                onPress={() => exportSubjectFile('recording')}
-                disabled={!selectedRecording?.recordingFile.exists || isBusy}
-              >
-                <Text style={styles.fileActionText}>녹음 내보내기</Text>
-              </Pressable>
-              <Pressable
-                style={[
-                  styles.fileActionButton,
-                  (!selectedRecording?.transcriptFile.exists || isBusy) && styles.disabledButton,
-                ]}
-                onPress={() => exportSubjectFile('transcript')}
-                disabled={!selectedRecording?.transcriptFile.exists || isBusy}
-              >
-                <Text style={styles.fileActionText}>전사 내보내기</Text>
-              </Pressable>
-              <Pressable
-                style={[styles.fileActionButton, (!selectedRecording?.summaryFile.exists || isBusy) && styles.disabledButton]}
-                onPress={() => exportSubjectFile('summary')}
-                disabled={!selectedRecording?.summaryFile.exists || isBusy}
-              >
-                <Text style={styles.fileActionText}>요약 내보내기</Text>
+              <Pressable style={[styles.modalButton, styles.modalSave]} onPress={() => void saveRecordedDraft()}>
+                <Text style={styles.modalButtonText}>저장</Text>
               </Pressable>
             </View>
-            <Text style={styles.status}>상태: {statusMessage}</Text>
-            <Text style={styles.apiInfo}>API: {apiBaseUrl}</Text>
-            {isBusy ? <ActivityIndicator color="#2563EB" style={styles.loader} /> : null}
           </View>
-        </ScrollView>
-      </SafeAreaView>
+        </View>
+      </Modal>
+
+      <Modal visible={uploadModalVisible} transparent animationType="fade" onRequestClose={() => setUploadModalVisible(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>녹음 파일 추가</Text>
+            <View style={styles.toggleRow}>
+              <Pressable
+                style={[styles.toggleButton, uploadMode === 'file' && styles.toggleButtonActive]}
+                onPress={() => setUploadMode('file')}
+              >
+                <Text style={styles.toggleText}>음성 파일 업로드</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.toggleButton, uploadMode === 'link' && styles.toggleButtonActive]}
+                onPress={() => setUploadMode('link')}
+              >
+                <Text style={styles.toggleText}>영상 링크</Text>
+              </Pressable>
+            </View>
+
+            {uploadMode === 'file' ? (
+              <>
+                <Pressable style={styles.openButton} onPress={() => void pickRecordingFile()}>
+                  <Text style={styles.openButtonText}>파일 선택</Text>
+                </Pressable>
+                <Text style={styles.helper}>{uploadName ? `선택: ${uploadName}` : '선택된 파일 없음'}</Text>
+              </>
+            ) : (
+              <TextInput
+                value={uploadVideoLink}
+                onChangeText={setUploadVideoLink}
+                style={styles.renameInput}
+                placeholder="https://..."
+                placeholderTextColor="#94A3B8"
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+            )}
+
+            <TextInput
+              value={uploadName}
+              onChangeText={setUploadName}
+              style={styles.renameInput}
+              placeholder="저장 파일명(확장자 제외 가능)"
+              placeholderTextColor="#94A3B8"
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+
+            <Text style={styles.modalLabel}>저장 폴더</Text>
+            <View style={styles.folderPickerList}>
+              {subjects.map((subject) => (
+                <Pressable
+                  key={`upload-${subject.id}`}
+                  style={[styles.folderPickerItem, uploadTargetFolderId === subject.id && styles.folderPickerItemActive]}
+                  onPress={() => setUploadTargetFolderId(subject.id)}
+                >
+                  <Text style={styles.folderPickerText}>
+                    {subject.icon} {subject.name}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <View style={styles.modalActions}>
+              <Pressable style={[styles.modalButton, styles.modalCancel]} onPress={() => setUploadModalVisible(false)}>
+                <Text style={styles.modalButtonText}>취소</Text>
+              </Pressable>
+              <Pressable style={[styles.modalButton, styles.modalSave]} onPress={() => void saveUploadedRecording()}>
+                <Text style={styles.modalButtonText}>저장</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </LinearGradient>
   );
 }
@@ -947,16 +2023,16 @@ function ModeToggle({ mode, onChange }: ModeToggleProps) {
   return (
     <View style={styles.toggleRow}>
       <Pressable
-        style={[styles.toggleButton, mode === 'api' && styles.toggleButtonActive]}
-        onPress={() => onChange('api')}
-      >
-        <Text style={styles.toggleText}>API 자동</Text>
-      </Pressable>
-      <Pressable
         style={[styles.toggleButton, mode === 'chat' && styles.toggleButtonActive]}
         onPress={() => onChange('chat')}
       >
         <Text style={styles.toggleText}>대화형 AI API</Text>
+      </Pressable>
+      <Pressable
+        style={[styles.toggleButton, mode === 'api' && styles.toggleButtonActive]}
+        onPress={() => onChange('api')}
+      >
+        <Text style={styles.toggleText}>API 자동</Text>
       </Pressable>
     </View>
   );
@@ -1009,7 +2085,7 @@ function listRecordingItems(paths: SubjectPaths): RecordingItem[] {
         continue;
       }
       const lowerName = entry.name.toLowerCase();
-      const isAudio = ['.m4a', '.mp3', '.wav', '.aac', '.webm', '.3gp', '.mp4'].some((ext) =>
+      const isAudio = ['.m4a', '.mp3', '.wav', '.aac', '.webm', '.3gp', '.mp4', '.url'].some((ext) =>
         lowerName.endsWith(ext),
       );
       if (!isAudio) {
@@ -1109,12 +2185,70 @@ function ensureSubjectsRoot() {
   }
 }
 
+function ensureTempRecordingsRoot() {
+  if (!TEMP_RECORDINGS_ROOT.exists) {
+    TEMP_RECORDINGS_ROOT.create({ idempotent: true, intermediates: true });
+  }
+}
+
 function writeText(file: File, value: string) {
   if (file.exists) {
     file.delete();
   }
   file.create({ intermediates: true });
   file.write(value);
+}
+
+function sanitizeFileBaseName(value: string): string {
+  return value.trim().replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_');
+}
+
+function normalizeFolderColor(value: string): string {
+  const trimmed = value.trim();
+  return /^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$/.test(trimmed)
+    ? trimmed
+    : DEFAULT_FOLDER_COLOR;
+}
+
+function normalizeSubjectTag(value: string): SubjectTag {
+  return value === 'general' || value === 'exam' ? value : 'major';
+}
+
+function recordingMimeType(fileName: string): string {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith('.wav')) return 'audio/wav';
+  if (lower.endsWith('.mp3')) return 'audio/mpeg';
+  if (lower.endsWith('.aac')) return 'audio/aac';
+  if (lower.endsWith('.webm')) return 'audio/webm';
+  if (lower.endsWith('.mp4')) return 'video/mp4';
+  if (lower.endsWith('.3gp')) return 'video/3gpp';
+  if (lower.endsWith('.url')) return 'text/plain';
+  return 'audio/m4a';
+}
+
+async function readJsonSafely(response: Response): Promise<any> {
+  const raw = await response.text();
+  if (!raw) {
+    return null;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { raw };
+  }
+}
+
+function getApiErrorMessage(payload: any, response: Response, fallback: string): string {
+  if (typeof payload?.detail === 'string' && payload.detail.trim()) {
+    return payload.detail.trim();
+  }
+  if (typeof payload?.error === 'string' && payload.error.trim()) {
+    return payload.error.trim();
+  }
+  if (typeof payload?.raw === 'string' && payload.raw.trim()) {
+    return payload.raw.trim();
+  }
+  return `${fallback} (${response.status})`;
 }
 
 function formatError(error: unknown): string {
@@ -1135,6 +2269,17 @@ function formatBytes(bytes: number): string {
     return `${(bytes / 1024).toFixed(1)} KB`;
   }
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function toTenLinePreview(value: string, fallback: string): string {
+  if (!value.trim()) {
+    return fallback;
+  }
+  const lines = value.split(/\r?\n/);
+  if (lines.length <= 10) {
+    return lines.join('\n');
+  }
+  return `${lines.slice(0, 10).join('\n')}\n...`;
 }
 
 const styles = StyleSheet.create({
@@ -1178,6 +2323,17 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
     marginBottom: 10,
+  },
+  sectionTitleInline: {
+    flex: 1,
+    color: '#1D4ED8',
+    fontSize: 15,
+    fontWeight: '700',
+    marginLeft: 8,
+  },
+  topRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
   },
   row: {
     flexDirection: 'row',
@@ -1238,6 +2394,25 @@ const styles = StyleSheet.create({
     marginTop: 10,
     gap: 8,
   },
+  cloudSyncRow: {
+    marginTop: 10,
+    flexDirection: 'row',
+    gap: 8,
+  },
+  cloudSyncButton: {
+    flex: 1,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#93C5FD',
+    backgroundColor: '#EEF6FF',
+    paddingVertical: 10,
+    alignItems: 'center',
+  },
+  cloudSyncButtonText: {
+    color: '#1E3A8A',
+    fontSize: 12,
+    fontWeight: '800',
+  },
   subjectRow: {
     flexDirection: 'row',
     gap: 8,
@@ -1260,9 +2435,32 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     fontSize: 14,
   },
+  subjectHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  folderIconBubble: {
+    width: 30,
+    height: 30,
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  folderIconText: {
+    fontSize: 16,
+  },
   subjectMeta: {
     color: '#475569',
     marginTop: 3,
+    fontSize: 12,
+  },
+  previewFileList: {
+    marginTop: 6,
+    gap: 2,
+  },
+  previewFileItem: {
+    color: '#475569',
     fontSize: 12,
   },
   tagBadge: {
@@ -1344,6 +2542,29 @@ const styles = StyleSheet.create({
     marginTop: 8,
     color: '#2563EB',
     fontSize: 12,
+  },
+  recordTimer: {
+    fontSize: 40,
+    fontWeight: '800',
+    color: '#0F172A',
+    letterSpacing: 1.2,
+    textAlign: 'center',
+    marginTop: 10,
+  },
+  renameButton: {
+    marginTop: 10,
+    alignSelf: 'flex-start',
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#93C5FD',
+    backgroundColor: '#EEF6FF',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  renameButtonText: {
+    color: '#1E3A8A',
+    fontSize: 12,
+    fontWeight: '800',
   },
   recordingList: {
     marginTop: 10,
@@ -1442,6 +2663,27 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     fontSize: 13,
   },
+  previewRow: {
+    marginTop: 10,
+    marginBottom: 6,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  editChip: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#93C5FD',
+    backgroundColor: '#EEF6FF',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  editChipText: {
+    color: '#1E3A8A',
+    fontSize: 12,
+    fontWeight: '700',
+  },
   bodyText: {
     color: '#0F172A',
     lineHeight: 21,
@@ -1460,7 +2702,189 @@ const styles = StyleSheet.create({
     marginTop: 4,
     fontSize: 12,
   },
+  pendingInfo: {
+    color: '#334155',
+    marginTop: 6,
+    fontSize: 12,
+  },
   loader: {
     marginTop: 10,
   },
+  deleteButton: {
+    marginTop: 12,
+    backgroundColor: '#DC2626',
+    borderRadius: 12,
+    paddingVertical: 11,
+    alignItems: 'center',
+  },
+  deleteButtonText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(15, 23, 42, 0.45)',
+    justifyContent: 'center',
+    paddingHorizontal: 16,
+  },
+  modalCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    padding: 14,
+  },
+  modalTitle: {
+    color: '#0F172A',
+    fontSize: 16,
+    fontWeight: '800',
+    marginBottom: 10,
+  },
+  modalLabel: {
+    marginTop: 8,
+    marginBottom: 6,
+    color: '#334155',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  optionWrap: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginBottom: 6,
+  },
+  optionChip: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    backgroundColor: '#F8FAFC',
+  },
+  optionChipActive: {
+    borderColor: '#2563EB',
+    backgroundColor: '#DBEAFE',
+  },
+  optionChipText: {
+    fontSize: 16,
+  },
+  colorChip: {
+    width: 26,
+    height: 26,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+  },
+  colorChipActive: {
+    borderWidth: 3,
+    borderColor: '#1D4ED8',
+  },
+  folderPickerList: {
+    maxHeight: 160,
+    gap: 6,
+  },
+  folderPickerItem: {
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    backgroundColor: '#F8FAFC',
+  },
+  folderPickerItemActive: {
+    borderColor: '#2563EB',
+    backgroundColor: '#DBEAFE',
+  },
+  folderPickerText: {
+    color: '#0F172A',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  modalInput: {
+    minHeight: 220,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    color: '#0F172A',
+    backgroundColor: '#F8FAFC',
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    textAlignVertical: 'top',
+  },
+  renameInput: {
+    minHeight: 44,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    color: '#0F172A',
+    backgroundColor: '#F8FAFC',
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    marginBottom: 4,
+  },
+  modalActions: {
+    marginTop: 12,
+    flexDirection: 'row',
+    gap: 8,
+  },
+  modalButton: {
+    flex: 1,
+    borderRadius: 12,
+    alignItems: 'center',
+    paddingVertical: 10,
+  },
+  modalCancel: {
+    backgroundColor: '#94A3B8',
+  },
+  modalSave: {
+    backgroundColor: '#2563EB',
+  },
+  modalButtonText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  fabContainer: {
+    position: 'absolute',
+    right: 20,
+    bottom: 26,
+    alignItems: 'flex-end',
+  },
+  fabMenu: {
+    marginBottom: 10,
+    gap: 8,
+    alignItems: 'flex-end',
+  },
+  fabMenuItem: {
+    backgroundColor: '#0F172A',
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  fabMenuText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  fabButton: {
+    width: 58,
+    height: 58,
+    borderRadius: 999,
+    backgroundColor: '#1D4ED8',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#0F172A',
+    shadowOpacity: 0.22,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 7,
+  },
+  fabButtonText: {
+    color: '#FFFFFF',
+    fontSize: 32,
+    lineHeight: 34,
+    fontWeight: '500',
+  },
 });
+

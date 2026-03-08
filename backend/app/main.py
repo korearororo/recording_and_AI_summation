@@ -11,8 +11,9 @@ from pathlib import Path
 from threading import Lock
 from urllib import request as urllib_request
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from app.config import Settings, get_settings
 from app.schemas import (
@@ -73,11 +74,75 @@ def _safe_segment(value: str) -> str:
     return (collapsed[:80] or "untitled").strip("_")
 
 
+def _safe_file_name(value: str, fallback: str) -> str:
+    candidate = Path(value or fallback).name.strip()
+    if not candidate:
+        candidate = fallback
+    if candidate in {".", ".."}:
+        candidate = fallback
+    return candidate.replace("\\", "_").replace("/", "_")
+
+
+def _find_subject_dir(root: Path, subject_id: str) -> Path | None:
+    suffix = f"__{_safe_segment(subject_id)}"
+    for entry in root.iterdir():
+        if entry.is_dir() and entry.name.endswith(suffix):
+            return entry
+    return None
+
+
 def _subject_library_dir(settings: Settings, subject_id: str, subject_name: str) -> Path:
     root = _resolve_library_root(settings)
-    folder_name = f"{_safe_segment(subject_name)}__{_safe_segment(subject_id)}"
+    existing = _find_subject_dir(root, subject_id)
+    if existing is not None:
+        return existing
+    folder_name = f"{_safe_segment(subject_name or subject_id)}__{_safe_segment(subject_id)}"
     target = root / folder_name
     target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _subject_meta_path(target_dir: Path) -> Path:
+    return target_dir / "meta.json"
+
+
+def _load_subject_meta(target_dir: Path) -> dict[str, object]:
+    meta_path = _subject_meta_path(target_dir)
+    if not meta_path.exists():
+        return {}
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_subject_meta(target_dir: Path, meta: dict[str, object]) -> None:
+    _subject_meta_path(target_dir).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _subject_data_dir(target_dir: Path, kind: str) -> Path:
+    mapping = {
+        "recording": target_dir / "recordings",
+        "transcript": target_dir / "transcripts",
+        "summary": target_dir / "summaries",
+    }
+    if kind not in mapping:
+        raise HTTPException(status_code=400, detail="kind must be one of: recording, transcript, summary")
+    data_dir = mapping[kind]
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
+
+
+def _resolve_library_file(settings: Settings, subject_id: str, kind: str, name: str) -> Path:
+    root = _resolve_library_root(settings)
+    subject_dir = _find_subject_dir(root, subject_id)
+    if subject_dir is None:
+        raise HTTPException(status_code=404, detail="subject not found")
+
+    safe_name = _safe_file_name(name, "file.bin")
+    target = _subject_data_dir(subject_dir, kind) / safe_name
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="file not found")
     return target
 
 
@@ -397,6 +462,11 @@ def sync_subject_files_to_library(
     subject_id: str = Form(...),
     subject_name: str = Form(...),
     subject_tag: str | None = Form(default=None),
+    subject_icon: str | None = Form(default=None),
+    subject_color: str | None = Form(default=None),
+    recording_name: str | None = Form(default=None),
+    transcript_name: str | None = Form(default=None),
+    summary_name: str | None = Form(default=None),
     recording: UploadFile | None = File(default=None),
     transcript: UploadFile | None = File(default=None),
     summary: UploadFile | None = File(default=None),
@@ -407,22 +477,35 @@ def sync_subject_files_to_library(
 
     try:
         if recording is not None:
-            _copy_upload_to(recording, target_dir / "recording.m4a")
-            saved_files.append("recording.m4a")
+            file_name = _safe_file_name(recording_name or recording.filename or "recording.m4a", "recording.m4a")
+            recording_target = _subject_data_dir(target_dir, "recording") / file_name
+            _copy_upload_to(recording, recording_target)
+            saved_files.append(f"recordings/{file_name}")
         if transcript is not None:
-            _copy_upload_to(transcript, target_dir / "transcript.txt")
-            saved_files.append("transcript.txt")
+            file_name = _safe_file_name(transcript_name or transcript.filename or "transcript.txt", "transcript.txt")
+            transcript_target = _subject_data_dir(target_dir, "transcript") / file_name
+            _copy_upload_to(transcript, transcript_target)
+            saved_files.append(f"transcripts/{file_name}")
         if summary is not None:
-            _copy_upload_to(summary, target_dir / "summary.txt")
-            saved_files.append("summary.txt")
+            file_name = _safe_file_name(summary_name or summary.filename or "summary.txt", "summary.txt")
+            summary_target = _subject_data_dir(target_dir, "summary") / file_name
+            _copy_upload_to(summary, summary_target)
+            saved_files.append(f"summaries/{file_name}")
 
-        meta = {
-            "id": subject_id,
-            "name": subject_name,
-            "tag": subject_tag or "",
-            "saved_files": saved_files,
-        }
-        (target_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        meta = _load_subject_meta(target_dir)
+        if not meta.get("created_at"):
+            meta["created_at"] = _now_ts()
+        meta.update(
+            {
+                "id": subject_id,
+                "name": subject_name,
+                "tag": subject_tag or "",
+                "icon": subject_icon or meta.get("icon") or "",
+                "color": subject_color or meta.get("color") or "",
+                "updated_at": _now_ts(),
+            }
+        )
+        _save_subject_meta(target_dir, meta)
 
         return LibrarySyncResponse(
             subject_id=subject_id,
@@ -449,14 +532,45 @@ def list_library(settings: Settings = Depends(get_settings)) -> dict[str, object
     for entry in sorted(root.iterdir()):
         if not entry.is_dir():
             continue
+        recordings_dir = entry / "recordings"
+        transcripts_dir = entry / "transcripts"
+        summaries_dir = entry / "summaries"
+        meta = _load_subject_meta(entry)
+
+        recordings = sorted([p.name for p in recordings_dir.iterdir() if p.is_file()]) if recordings_dir.exists() else []
+        transcripts = (
+            sorted([p.name for p in transcripts_dir.iterdir() if p.is_file()]) if transcripts_dir.exists() else []
+        )
+        summaries = sorted([p.name for p in summaries_dir.iterdir() if p.is_file()]) if summaries_dir.exists() else []
+        subject_id = str(meta.get("id") or entry.name.split("__")[-1])
+        subject_name = str(meta.get("name") or subject_id)
         subjects.append(
             {
                 "folder": entry.name,
                 "path": str(entry.resolve()),
-                "recording": (entry / "recording.m4a").exists(),
-                "transcript": (entry / "transcript.txt").exists(),
-                "summary": (entry / "summary.txt").exists(),
+                "subject_id": subject_id,
+                "subject_name": subject_name,
+                "subject_tag": str(meta.get("tag") or ""),
+                "subject_icon": str(meta.get("icon") or ""),
+                "subject_color": str(meta.get("color") or ""),
+                "recording": len(recordings) > 0,
+                "transcript": len(transcripts) > 0,
+                "summary": len(summaries) > 0,
+                "recordings": recordings,
+                "transcripts": transcripts,
+                "summaries": summaries,
             }
         )
 
     return {"root_dir": str(root.resolve()), "subjects": subjects}
+
+
+@app.get("/api/library/file")
+def download_library_file(
+    subject_id: str = Query(...),
+    kind: str = Query(...),
+    name: str = Query(...),
+    settings: Settings = Depends(get_settings),
+) -> FileResponse:
+    target = _resolve_library_file(settings, subject_id, kind, name)
+    return FileResponse(path=str(target), filename=target.name, media_type="application/octet-stream")
