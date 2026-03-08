@@ -100,7 +100,8 @@ type AuthUserProfile = {
 
 type SocialProvider = 'kakao' | 'google' | 'naver';
 
-const FALLBACK_API_URL = Platform.OS === 'android' ? 'http://10.0.2.2:8000' : 'http://localhost:8000';
+const PROD_API_URL = 'https://recording-ai-backend.onrender.com';
+const FALLBACK_API_URL = PROD_API_URL;
 const PENDING_JOBS_FILE = new File(Paths.document, 'pending-jobs.json');
 const AUTH_SESSION_FILE = new File(Paths.document, 'auth-session.json');
 const TEMP_RECORDINGS_ROOT = new Directory(Paths.cache, 'temp-recordings');
@@ -201,12 +202,16 @@ export default function App() {
   const [authUser, setAuthUser] = useState<AuthUserProfile | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
 
-  const apiBaseUrl =
+  const rawApiBaseUrl =
     process.env.EXPO_PUBLIC_API_BASE_URL ??
     (Platform.OS === 'android'
       ? process.env.EXPO_PUBLIC_API_BASE_URL_ANDROID
       : process.env.EXPO_PUBLIC_API_BASE_URL_IOS) ??
     FALLBACK_API_URL;
+  const apiBaseUrl =
+    Platform.OS === 'android' && Constants.isDevice && rawApiBaseUrl.includes('10.0.2.2')
+      ? PROD_API_URL
+      : rawApiBaseUrl;
 
   const getAuthHeaders = (): Record<string, string> => {
     if (!authToken) {
@@ -527,6 +532,9 @@ export default function App() {
   const submitSocialAuth = async (provider: SocialProvider) => {
     try {
       setAuthBusy(true);
+      if (!apiBaseUrl.startsWith('https://')) {
+        throw new Error('소셜 로그인은 HTTPS 서버 주소가 필요합니다. 설정의 API URL을 확인해주세요.');
+      }
       const redirectUri = Linking.createURL('auth/callback');
       const startUrl =
         `${apiBaseUrl}/api/auth/oauth/${provider}/start?mobile_redirect_uri=` + encodeURIComponent(redirectUri);

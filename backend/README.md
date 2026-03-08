@@ -28,6 +28,18 @@ If you want to use the app from any network (not only your home/PC LAN), deploy 
 4. Rebuild mobile app with:
    - `EXPO_PUBLIC_API_BASE_URL=https://<your-backend-domain>`
 
+## Windows 24/7 Self-Hosting
+If you want to run this on your own Windows PC (always-on server), use:
+
+- [backend/deploy/windows/README.md](./deploy/windows/README.md)
+
+One-command setup script:
+
+```powershell
+cd backend\deploy\windows
+.\setup-24x7-server.ps1 -Domain "api.your-domain.com" -OpenAIApiKey "sk-..." -InstallFfmpeg
+```
+
 ## API
 - `POST /api/transcribe` : audio file -> transcript
 - `POST /api/transcribe-chat` : audio file -> transcript (chat model refinement)

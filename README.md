@@ -62,3 +62,8 @@ Deploy backend to Render using the included `render.yaml`.
 4. Deploy and confirm: `https://<your-render-domain>/health` returns `{"status":"ok"}`.
 5. Rebuild mobile app with:
    - `EXPO_PUBLIC_API_BASE_URL=https://<your-render-domain>`
+
+## 24/7 Self-Hosting on Another Windows PC
+If you want to keep your own server PC on 24/7 instead of cloud:
+
+- See [backend/deploy/windows/README.md](backend/deploy/windows/README.md)
