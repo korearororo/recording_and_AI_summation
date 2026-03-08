@@ -53,3 +53,27 @@ class JobStatusResponse(BaseModel):
     error: str | None = None
     created_at: float
     updated_at: float
+
+
+class AuthUser(BaseModel):
+    id: str
+    email: str
+    display_name: str
+
+
+class AuthRegisterRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=6, max_length=256)
+    display_name: str | None = Field(default=None, max_length=80)
+
+
+class AuthLoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=6, max_length=256)
+
+
+class AuthSessionResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_at: float
+    user: AuthUser

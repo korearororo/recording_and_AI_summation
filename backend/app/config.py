@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     openai_max_retries: int = Field(default=1, alias="OPENAI_MAX_RETRIES")
     allowed_origins: str = Field(default="*", alias="ALLOWED_ORIGINS")
     library_root: str = Field(default="library", alias="LIBRARY_ROOT")
+    auth_db_path: str = Field(default="auth/auth.db", alias="AUTH_DB_PATH")
+    auth_session_hours: int = Field(default=24 * 30, alias="AUTH_SESSION_HOURS")
 
     @property
     def allowed_origins_list(self) -> List[str]:

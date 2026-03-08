@@ -11,12 +11,16 @@ from pathlib import Path
 from threading import Lock
 from urllib import request as urllib_request
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from app.config import Settings, get_settings
 from app.schemas import (
+    AuthLoginRequest,
+    AuthRegisterRequest,
+    AuthSessionResponse,
+    AuthUser,
     AsyncSummarizeRequest,
     JobCreateResponse,
     JobStatusResponse,
@@ -26,6 +30,7 @@ from app.schemas import (
     SummarizeResponse,
     TranscriptionResponse,
 )
+from app.services.auth_store import AuthStore
 from app.services.openai_service import OpenAIService
 
 app = FastAPI(title="Recording & AI Summary API", version="0.1.0")
@@ -33,6 +38,8 @@ app = FastAPI(title="Recording & AI Summary API", version="0.1.0")
 JOB_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 JOB_LOCK = Lock()
 JOBS: dict[str, dict[str, object]] = {}
+AUTH_LOCK = Lock()
+AUTH_STORE: AuthStore | None = None
 
 
 def _configure_cors(settings: Settings) -> None:
@@ -53,6 +60,48 @@ def _require_api_key(settings: Settings = Depends(get_settings)) -> None:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is missing")
 
 
+def _resolve_auth_db_path(settings: Settings) -> Path:
+    path = Path(settings.auth_db_path)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[1] / path
+    return path
+
+
+def _get_auth_store(settings: Settings) -> AuthStore:
+    global AUTH_STORE
+    if AUTH_STORE is None:
+        with AUTH_LOCK:
+            if AUTH_STORE is None:
+                AUTH_STORE = AuthStore(
+                    db_path=_resolve_auth_db_path(settings),
+                    session_ttl_hours=settings.auth_session_hours,
+                )
+    return AUTH_STORE
+
+
+def _extract_bearer_token(authorization: str | None) -> str:
+    raw = (authorization or "").strip()
+    if not raw:
+        return ""
+    prefix = "bearer "
+    if raw.lower().startswith(prefix):
+        return raw[len(prefix) :].strip()
+    return ""
+
+
+def _require_user(
+    authorization: str | None = Header(default=None),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, str]:
+    token = _extract_bearer_token(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Authorization token is required")
+    user = _get_auth_store(settings).get_user_by_token(token)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return user
+
+
 def _save_upload_to_temp(upload: UploadFile) -> str:
     extension = Path(upload.filename or "recording.m4a").suffix or ".m4a"
     with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as temp_file:
@@ -60,10 +109,12 @@ def _save_upload_to_temp(upload: UploadFile) -> str:
         return temp_file.name
 
 
-def _resolve_library_root(settings: Settings) -> Path:
+def _resolve_library_root(settings: Settings, user_id: str | None = None) -> Path:
     root = Path(settings.library_root)
     if not root.is_absolute():
         root = Path(__file__).resolve().parents[1] / root
+    if user_id:
+        root = root / f"user_{_safe_segment(user_id)}"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -91,8 +142,8 @@ def _find_subject_dir(root: Path, subject_id: str) -> Path | None:
     return None
 
 
-def _subject_library_dir(settings: Settings, subject_id: str, subject_name: str) -> Path:
-    root = _resolve_library_root(settings)
+def _subject_library_dir(settings: Settings, subject_id: str, subject_name: str, user_id: str) -> Path:
+    root = _resolve_library_root(settings, user_id)
     existing = _find_subject_dir(root, subject_id)
     if existing is not None:
         return existing
@@ -133,8 +184,8 @@ def _subject_data_dir(target_dir: Path, kind: str) -> Path:
     return data_dir
 
 
-def _resolve_library_file(settings: Settings, subject_id: str, kind: str, name: str) -> Path:
-    root = _resolve_library_root(settings)
+def _resolve_library_file(settings: Settings, user_id: str, subject_id: str, kind: str, name: str) -> Path:
+    root = _resolve_library_root(settings, user_id)
     subject_dir = _find_subject_dir(root, subject_id)
     if subject_dir is None:
         raise HTTPException(status_code=404, detail="subject not found")
@@ -300,6 +351,73 @@ def _run_summarize_job(job_id: str, transcript: str, mode: str, file_name: str, 
 
 @app.get("/health")
 def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+def _build_auth_session_response(user: dict[str, str], token: str, expires_at: float) -> AuthSessionResponse:
+    return AuthSessionResponse(
+        access_token=token,
+        token_type="bearer",
+        expires_at=expires_at,
+        user=AuthUser(
+            id=user["id"],
+            email=user["email"],
+            display_name=user["display_name"],
+        ),
+    )
+
+
+@app.post("/api/auth/register", response_model=AuthSessionResponse)
+def register_auth(
+    body: AuthRegisterRequest,
+    settings: Settings = Depends(get_settings),
+) -> AuthSessionResponse:
+    try:
+        store = _get_auth_store(settings)
+        user = store.create_user(body.email, body.password, body.display_name)
+        token, expires_at = store.create_session(user["id"])
+        return _build_auth_session_response(user, token, expires_at)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Registration failed: {exc}") from exc
+
+
+@app.post("/api/auth/login", response_model=AuthSessionResponse)
+def login_auth(
+    body: AuthLoginRequest,
+    settings: Settings = Depends(get_settings),
+) -> AuthSessionResponse:
+    try:
+        store = _get_auth_store(settings)
+        user = store.authenticate(body.email, body.password)
+        if user is None:
+            raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 올바르지 않습니다.")
+        token, expires_at = store.create_session(user["id"])
+        return _build_auth_session_response(user, token, expires_at)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Login failed: {exc}") from exc
+
+
+@app.get("/api/auth/me", response_model=AuthUser)
+def me_auth(current_user: dict[str, str] = Depends(_require_user)) -> AuthUser:
+    return AuthUser(
+        id=current_user["id"],
+        email=current_user["email"],
+        display_name=current_user["display_name"],
+    )
+
+
+@app.post("/api/auth/logout")
+def logout_auth(
+    authorization: str | None = Header(default=None),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, str]:
+    token = _extract_bearer_token(authorization)
+    if token:
+        _get_auth_store(settings).invalidate_session(token)
     return {"status": "ok"}
 
 
@@ -471,8 +589,9 @@ def sync_subject_files_to_library(
     transcript: UploadFile | None = File(default=None),
     summary: UploadFile | None = File(default=None),
     settings: Settings = Depends(get_settings),
+    current_user: dict[str, str] = Depends(_require_user),
 ) -> LibrarySyncResponse:
-    target_dir = _subject_library_dir(settings, subject_id, subject_name)
+    target_dir = _subject_library_dir(settings, subject_id, subject_name, current_user["id"])
     saved_files: list[str] = []
 
     try:
@@ -525,8 +644,11 @@ def sync_subject_files_to_library(
 
 
 @app.get("/api/library")
-def list_library(settings: Settings = Depends(get_settings)) -> dict[str, object]:
-    root = _resolve_library_root(settings)
+def list_library(
+    settings: Settings = Depends(get_settings),
+    current_user: dict[str, str] = Depends(_require_user),
+) -> dict[str, object]:
+    root = _resolve_library_root(settings, current_user["id"])
     subjects: list[dict[str, object]] = []
 
     for entry in sorted(root.iterdir()):
@@ -571,6 +693,7 @@ def download_library_file(
     kind: str = Query(...),
     name: str = Query(...),
     settings: Settings = Depends(get_settings),
+    current_user: dict[str, str] = Depends(_require_user),
 ) -> FileResponse:
-    target = _resolve_library_file(settings, subject_id, kind, name)
+    target = _resolve_library_file(settings, current_user["id"], subject_id, kind, name)
     return FileResponse(path=str(target), filename=target.name, media_type="application/octet-stream")

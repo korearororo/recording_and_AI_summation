@@ -90,8 +90,15 @@ type PendingJob = {
   fileName: string;
 };
 
+type AuthUserProfile = {
+  id: string;
+  email: string;
+  display_name: string;
+};
+
 const FALLBACK_API_URL = Platform.OS === 'android' ? 'http://10.0.2.2:8000' : 'http://localhost:8000';
 const PENDING_JOBS_FILE = new File(Paths.document, 'pending-jobs.json');
+const AUTH_SESSION_FILE = new File(Paths.document, 'auth-session.json');
 const TEMP_RECORDINGS_ROOT = new Directory(Paths.cache, 'temp-recordings');
 const FOLDER_ICON_OPTIONS = ['📁', '📘', '📗', '📕', '🧪', '💻', '📊', '🎵'];
 const FOLDER_COLOR_OPTIONS = ['#DBEAFE', '#E9D5FF', '#FCE7F3', '#DCFCE7', '#FEF3C7', '#E0F2FE', '#F1F5F9'];
@@ -174,6 +181,14 @@ export default function App() {
   const [isBusy, setIsBusy] = useState(false);
   const [libraryPath, setLibraryPath] = useState('');
   const [librarySavedFiles, setLibrarySavedFiles] = useState<string[]>([]);
+  const [authModalVisible, setAuthModalVisible] = useState(false);
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authDisplayName, setAuthDisplayName] = useState('');
+  const [authToken, setAuthToken] = useState('');
+  const [authUser, setAuthUser] = useState<AuthUserProfile | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
 
   const apiBaseUrl =
     process.env.EXPO_PUBLIC_API_BASE_URL ??
@@ -181,6 +196,13 @@ export default function App() {
       ? process.env.EXPO_PUBLIC_API_BASE_URL_ANDROID
       : process.env.EXPO_PUBLIC_API_BASE_URL_IOS) ??
     FALLBACK_API_URL;
+
+  const getAuthHeaders = (): Record<string, string> => {
+    if (!authToken) {
+      return {};
+    }
+    return { Authorization: `Bearer ${authToken}` };
+  };
 
   const selectedSubject = useMemo(
     () => subjects.find((subject) => subject.id === selectedSubjectId) ?? null,
@@ -246,6 +268,7 @@ export default function App() {
   const initialize = async () => {
     ensureSubjectsRoot();
     await setupNotifications();
+    await restoreAuthSession();
     await restorePendingJobs();
     await loadSubjects();
   };
@@ -370,6 +393,139 @@ export default function App() {
       });
     } catch {
       // Keep core flow even if local notification fails.
+    }
+  };
+
+  const persistAuthSession = (token: string, user: AuthUserProfile | null) => {
+    try {
+      if (!token || !user) {
+        if (AUTH_SESSION_FILE.exists) {
+          AUTH_SESSION_FILE.delete();
+        }
+        return;
+      }
+      writeText(
+        AUTH_SESSION_FILE,
+        JSON.stringify(
+          {
+            access_token: token,
+            user,
+          },
+          null,
+          2,
+        ),
+      );
+    } catch {
+      // Session persistence failure should not block app usage.
+    }
+  };
+
+  const clearAuthSession = () => {
+    setAuthToken('');
+    setAuthUser(null);
+    persistAuthSession('', null);
+  };
+
+  const restoreAuthSession = async () => {
+    if (!AUTH_SESSION_FILE.exists) {
+      return;
+    }
+
+    try {
+      const raw = await AUTH_SESSION_FILE.text();
+      const parsed = JSON.parse(raw);
+      const token = typeof parsed?.access_token === 'string' ? parsed.access_token : '';
+      if (!token) {
+        clearAuthSession();
+        return;
+      }
+
+      const response = await fetch(`${apiBaseUrl}/api/auth/me`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const payload = await readJsonSafely(response);
+      if (!response.ok) {
+        clearAuthSession();
+        return;
+      }
+      const user = normalizeAuthUser(payload);
+      if (!user) {
+        clearAuthSession();
+        return;
+      }
+      setAuthToken(token);
+      setAuthUser(user);
+      persistAuthSession(token, user);
+    } catch {
+      clearAuthSession();
+    }
+  };
+
+  const submitAuth = async () => {
+    const email = authEmail.trim();
+    const password = authPassword;
+    if (!email || !password) {
+      setStatusMessage('이메일/비밀번호를 입력해주세요.');
+      return;
+    }
+
+    try {
+      setAuthBusy(true);
+      const endpoint = authMode === 'register' ? '/api/auth/register' : '/api/auth/login';
+      const body =
+        authMode === 'register'
+          ? {
+              email,
+              password,
+              display_name: authDisplayName.trim() || undefined,
+            }
+          : {
+              email,
+              password,
+            };
+
+      const response = await fetch(`${apiBaseUrl}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const payload = await readJsonSafely(response);
+      if (!response.ok) {
+        throw new Error(getApiErrorMessage(payload, response, '로그인 실패'));
+      }
+
+      const token = typeof payload?.access_token === 'string' ? payload.access_token : '';
+      const user = normalizeAuthUser(payload?.user);
+      if (!token || !user) {
+        throw new Error('로그인 응답이 올바르지 않습니다.');
+      }
+
+      setAuthToken(token);
+      setAuthUser(user);
+      persistAuthSession(token, user);
+      setAuthModalVisible(false);
+      setAuthPassword('');
+      setStatusMessage(`${user.display_name} 계정으로 로그인되었습니다.`);
+    } catch (error) {
+      setStatusMessage(`인증 실패: ${formatError(error)}`);
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const logoutAuth = async () => {
+    try {
+      if (authToken) {
+        await fetch(`${apiBaseUrl}/api/auth/logout`, {
+          method: 'POST',
+          headers: getAuthHeaders(),
+        });
+      }
+    } catch {
+      // Ignore logout call errors and clear local session anyway.
+    } finally {
+      clearAuthSession();
+      setStatusMessage('로그아웃되었습니다.');
     }
   };
 
@@ -1194,8 +1350,12 @@ export default function App() {
   };
 
   const postLibrarySync = async (formData: FormData) => {
+    if (!authToken) {
+      throw new Error('먼저 로그인해주세요.');
+    }
     const response = await fetch(`${apiBaseUrl}/api/library/sync`, {
       method: 'POST',
+      headers: getAuthHeaders(),
       body: formData,
     });
     const payload = await readJsonSafely(response);
@@ -1206,6 +1366,12 @@ export default function App() {
   };
 
   const uploadAllFoldersToCloud = async () => {
+    if (!authToken) {
+      setAuthMode('login');
+      setAuthModalVisible(true);
+      setStatusMessage('먼저 로그인해주세요.');
+      return;
+    }
     try {
       setIsBusy(true);
       setStatusMessage('서버 업로드 시작...');
@@ -1302,11 +1468,19 @@ export default function App() {
   };
 
   const restoreAllFoldersFromCloud = async () => {
+    if (!authToken) {
+      setAuthMode('login');
+      setAuthModalVisible(true);
+      setStatusMessage('먼저 로그인해주세요.');
+      return;
+    }
     try {
       setIsBusy(true);
       setStatusMessage('서버 복원 시작...');
 
-      const response = await fetch(`${apiBaseUrl}/api/library`);
+      const response = await fetch(`${apiBaseUrl}/api/library`, {
+        headers: getAuthHeaders(),
+      });
       const payload = await readJsonSafely(response);
       if (!response.ok) {
         throw new Error(getApiErrorMessage(payload, response, '서버 목록 조회 실패'));
@@ -1369,6 +1543,7 @@ export default function App() {
           await File.downloadFileAsync(
             `${apiBaseUrl}/api/library/file?subject_id=${encodeURIComponent(subjectId)}&kind=recording&name=${encodeURIComponent(name)}`,
             target,
+            { headers: getAuthHeaders() },
           );
           downloadedFiles += 1;
         }
@@ -1380,6 +1555,7 @@ export default function App() {
           await File.downloadFileAsync(
             `${apiBaseUrl}/api/library/file?subject_id=${encodeURIComponent(subjectId)}&kind=transcript&name=${encodeURIComponent(name)}`,
             target,
+            { headers: getAuthHeaders() },
           );
           downloadedFiles += 1;
         }
@@ -1391,6 +1567,7 @@ export default function App() {
           await File.downloadFileAsync(
             `${apiBaseUrl}/api/library/file?subject_id=${encodeURIComponent(subjectId)}&kind=summary&name=${encodeURIComponent(name)}`,
             target,
+            { headers: getAuthHeaders() },
           );
           downloadedFiles += 1;
         }
@@ -1528,6 +1705,26 @@ export default function App() {
             <View style={styles.card}>
               <Text style={styles.sectionTitle}>폴더 목록</Text>
               <Text style={styles.helper}>아래 폴더 박스를 누르면 내부 녹음 파일 목록이 열립니다.</Text>
+              <View style={styles.authRow}>
+                <Text style={styles.authText}>
+                  {authUser ? `계정: ${authUser.display_name} (${authUser.email})` : '계정: 로그인 필요'}
+                </Text>
+                {authUser ? (
+                  <Pressable style={styles.authButton} onPress={logoutAuth}>
+                    <Text style={styles.authButtonText}>로그아웃</Text>
+                  </Pressable>
+                ) : (
+                  <Pressable
+                    style={styles.authButton}
+                    onPress={() => {
+                      setAuthMode('login');
+                      setAuthModalVisible(true);
+                    }}
+                  >
+                    <Text style={styles.authButtonText}>로그인</Text>
+                  </Pressable>
+                )}
+              </View>
               <View style={styles.cloudSyncRow}>
                 <Pressable
                   style={[styles.cloudSyncButton, isBusy && styles.disabledButton]}
@@ -1828,6 +2025,69 @@ export default function App() {
                 disabled={isBusy}
               >
                 <Text style={styles.modalButtonText}>변경</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={authModalVisible} transparent animationType="fade" onRequestClose={() => setAuthModalVisible(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>{authMode === 'register' ? '회원가입' : '로그인'}</Text>
+            <View style={styles.toggleRow}>
+              <Pressable
+                style={[styles.toggleButton, authMode === 'login' && styles.toggleButtonActive]}
+                onPress={() => setAuthMode('login')}
+              >
+                <Text style={styles.toggleText}>로그인</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.toggleButton, authMode === 'register' && styles.toggleButtonActive]}
+                onPress={() => setAuthMode('register')}
+              >
+                <Text style={styles.toggleText}>회원가입</Text>
+              </Pressable>
+            </View>
+            {authMode === 'register' ? (
+              <TextInput
+                value={authDisplayName}
+                onChangeText={setAuthDisplayName}
+                style={styles.renameInput}
+                placeholder="표시 이름"
+                placeholderTextColor="#94A3B8"
+              />
+            ) : null}
+            <TextInput
+              value={authEmail}
+              onChangeText={setAuthEmail}
+              style={styles.renameInput}
+              placeholder="이메일"
+              placeholderTextColor="#94A3B8"
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="email-address"
+            />
+            <TextInput
+              value={authPassword}
+              onChangeText={setAuthPassword}
+              style={styles.renameInput}
+              placeholder="비밀번호 (6자 이상)"
+              placeholderTextColor="#94A3B8"
+              autoCapitalize="none"
+              autoCorrect={false}
+              secureTextEntry
+            />
+            <View style={styles.modalActions}>
+              <Pressable style={[styles.modalButton, styles.modalCancel]} onPress={() => setAuthModalVisible(false)}>
+                <Text style={styles.modalButtonText}>취소</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.modalButton, styles.modalSave, authBusy && styles.disabledButton]}
+                onPress={() => void submitAuth()}
+                disabled={authBusy}
+              >
+                <Text style={styles.modalButtonText}>{authMode === 'register' ? '가입' : '로그인'}</Text>
               </Pressable>
             </View>
           </View>
@@ -2214,6 +2474,23 @@ function normalizeSubjectTag(value: string): SubjectTag {
   return value === 'general' || value === 'exam' ? value : 'major';
 }
 
+function normalizeAuthUser(payload: any): AuthUserProfile | null {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+  const id = typeof payload.id === 'string' ? payload.id.trim() : '';
+  const email = typeof payload.email === 'string' ? payload.email.trim() : '';
+  const displayName = typeof payload.display_name === 'string' ? payload.display_name.trim() : '';
+  if (!id || !email) {
+    return null;
+  }
+  return {
+    id,
+    email,
+    display_name: displayName || email.split('@')[0] || 'user',
+  };
+}
+
 function recordingMimeType(fileName: string): string {
   const lower = fileName.toLowerCase();
   if (lower.endsWith('.wav')) return 'audio/wav';
@@ -2398,6 +2675,31 @@ const styles = StyleSheet.create({
     marginTop: 10,
     flexDirection: 'row',
     gap: 8,
+  },
+  authRow: {
+    marginTop: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  authText: {
+    flex: 1,
+    color: '#334155',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  authButton: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#93C5FD',
+    backgroundColor: '#EEF6FF',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  authButtonText: {
+    color: '#1E3A8A',
+    fontSize: 12,
+    fontWeight: '800',
   },
   cloudSyncButton: {
     flex: 1,
