@@ -2077,12 +2077,13 @@ export default function App() {
 
       <Modal visible={editorVisible} transparent animationType="slide" onRequestClose={() => setEditorVisible(false)}>
         <View style={styles.modalOverlay}>
-          <View style={styles.modalCard}>
+          <View style={[styles.modalCard, styles.editorModalCard]}>
             <Text style={styles.modalTitle}>{editorTarget === 'summary' ? '요약 전체 편집' : '전사 전체 편집'}</Text>
             <TextInput
               value={editorText}
               onChangeText={setEditorText}
               multiline
+              scrollEnabled
               style={styles.modalInput}
               placeholder="내용을 입력하세요"
               placeholderTextColor="#94A3B8"
@@ -3203,6 +3204,9 @@ const styles = StyleSheet.create({
     borderColor: '#BFDBFE',
     padding: 14,
   },
+  editorModalCard: {
+    maxHeight: '86%',
+  },
   modalTitle: {
     color: '#0F172A',
     fontSize: 16,
@@ -3307,7 +3311,8 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   modalInput: {
-    minHeight: 220,
+    height: 320,
+    maxHeight: 420,
     borderRadius: 12,
     borderWidth: 1,
     borderColor: '#CBD5E1',
