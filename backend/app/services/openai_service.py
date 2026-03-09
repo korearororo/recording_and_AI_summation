@@ -47,6 +47,9 @@ class OpenAIService:
         source_path = Path(file_path)
         max_upload_bytes = self.settings.transcribe_max_file_mb * 1024 * 1024
 
+        if self.settings.transcribe_force_chunking:
+            return self._transcribe_large_file(source_path, max_upload_bytes)
+
         if source_path.stat().st_size <= max_upload_bytes:
             try:
                 return self._transcribe_single_file(source_path)
@@ -73,11 +76,17 @@ class OpenAIService:
 
     def transcribe_with_chat(self, file_path: str) -> str:
         raw = self.transcribe_file(file_path)
-        response = self.client.responses.create(
-            model=self.settings.chat_transcribe_model,
-            instructions=CHAT_TRANSCRIBE_PROMPT,
-            input=f"다음 전사 원문을 교정해줘.\n<TRANSCRIPT>\n{raw}\n</TRANSCRIPT>",
-        )
+        try:
+            response = self.client.responses.create(
+                model=self.settings.chat_transcribe_model,
+                instructions=CHAT_TRANSCRIBE_PROMPT,
+                input=f"다음 전사 원문을 교정해줘.\n<TRANSCRIPT>\n{raw}\n</TRANSCRIPT>",
+            )
+        except Exception as exc:
+            # If refinement input is too large, keep raw transcription instead of failing the job.
+            if _should_skip_refinement(exc):
+                return raw
+            raise
         output_text = getattr(response, "output_text", None)
         if isinstance(output_text, str) and output_text.strip():
             candidate = _cleanup_transcript_tags(output_text.strip())
@@ -255,3 +264,13 @@ def _looks_like_empty_summary(text: str) -> bool:
 def _should_retry_with_chunking(error: Exception) -> bool:
     message = str(error).lower()
     return "input_too_large" in message or "too large for this model" in message
+
+
+def _should_skip_refinement(error: Exception) -> bool:
+    message = str(error).lower()
+    return (
+        "input_too_large" in message
+        or "too large for this model" in message
+        or "maximum context length" in message
+        or "context length" in message
+    )

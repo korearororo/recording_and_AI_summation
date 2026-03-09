@@ -43,11 +43,13 @@ services:
       - key: TRANSCRIBE_MAX_FILE_MB
         value: "24"
       - key: TRANSCRIBE_CHUNK_MINUTES
-        value: "10"
+        value: "5"
       - key: TRANSCRIBE_CHUNK_BITRATE
         value: "64k"
       - key: TRANSCRIBE_PARALLEL_CHUNKS
         value: "3"
+      - key: TRANSCRIBE_FORCE_CHUNKING
+        value: "true"
       - key: OPENAI_TIMEOUT_SECONDS
         value: "300"
       - key: OPENAI_MAX_RETRIES
