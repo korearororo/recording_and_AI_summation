@@ -36,7 +36,11 @@ services:
         value: "gpt-4o-mini-transcribe"
       - key: SUMMARY_MODEL
         value: "gpt-4.1-mini"
+      - key: TRANSLATION_MODEL
+        value: "gpt-4.1-mini"
       - key: CHAT_TRANSCRIBE_MODEL
+        value: "gpt-4.1-mini"
+      - key: CHAT_TRANSLATION_MODEL
         value: "gpt-4.1-mini"
       - key: CHAT_SUMMARY_MODEL
         value: "gpt-4.1-mini"

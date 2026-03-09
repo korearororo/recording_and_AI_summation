@@ -57,6 +57,7 @@ type SubjectItem = {
   color: string;
   hasRecording: boolean;
   hasTranscript: boolean;
+  hasTranslation: boolean;
   hasSummary: boolean;
   updatedAt: number;
   previewFiles: string[];
@@ -67,6 +68,7 @@ type RecordingItem = {
   title: string;
   recordingFile: File;
   transcriptFile: File;
+  translationFile: File;
   summaryFile: File;
   updatedAt: number;
   isLegacy: boolean;
@@ -77,15 +79,17 @@ type SubjectPaths = {
   meta: File;
   recordingsDir: Directory;
   transcriptsDir: Directory;
+  translationsDir: Directory;
   summariesDir: Directory;
   legacyRecording: File;
   legacyTranscript: File;
+  legacyTranslation: File;
   legacySummary: File;
 };
 
 type PendingJob = {
   jobId: string;
-  jobType: 'transcribe' | 'summarize';
+  jobType: 'transcribe' | 'translate' | 'summarize';
   mode: ProcessMode;
   subjectId: string;
   recordingId: string;
@@ -175,10 +179,11 @@ export default function App() {
   const [recordings, setRecordings] = useState<RecordingItem[]>([]);
   const [selectedRecordingId, setSelectedRecordingId] = useState<string | null>(null);
   const [transcript, setTranscript] = useState('');
+  const [translation, setTranslation] = useState('');
   const [summary, setSummary] = useState('');
   const [screenMode, setScreenMode] = useState<'home' | 'subject' | 'detail' | 'record'>('home');
   const [editorVisible, setEditorVisible] = useState(false);
-  const [editorTarget, setEditorTarget] = useState<'transcript' | 'summary' | null>(null);
+  const [editorTarget, setEditorTarget] = useState<'transcript' | 'translation' | 'summary' | null>(null);
   const [editorText, setEditorText] = useState('');
   const [renameVisible, setRenameVisible] = useState(false);
   const [renameText, setRenameText] = useState('');
@@ -187,6 +192,8 @@ export default function App() {
   const pollingRef = useRef(false);
 
   const [transcribeMode, setTranscribeMode] = useState<ProcessMode>('chat');
+  const [translationMode, setTranslationMode] = useState<ProcessMode>('chat');
+  const [translationTargetLanguage, setTranslationTargetLanguage] = useState<'English' | 'Korean'>('English');
   const [summaryMode, setSummaryMode] = useState<ProcessMode>('chat');
 
   const [statusMessage, setStatusMessage] = useState('준비 완료');
@@ -271,6 +278,7 @@ export default function App() {
       setRecordings([]);
       setSelectedRecordingId(null);
       setTranscript('');
+      setTranslation('');
       setSummary('');
       setLibraryPath('');
       setLibrarySavedFiles([]);
@@ -366,7 +374,7 @@ export default function App() {
     try {
       if (Platform.OS === 'android') {
         await Notifications.setNotificationChannelAsync('job-status', {
-          name: '전사/요약 상태',
+          name: '전사/번역/요약 상태',
           importance: Notifications.AndroidImportance.HIGH,
           vibrationPattern: [0, 250, 250, 250],
           sound: 'default',
@@ -617,7 +625,7 @@ export default function App() {
       const jobs = parsed.filter((value): value is PendingJob => {
         return (
           typeof value?.jobId === 'string' &&
-          (value?.jobType === 'transcribe' || value?.jobType === 'summarize') &&
+          (value?.jobType === 'transcribe' || value?.jobType === 'translate' || value?.jobType === 'summarize') &&
           typeof value?.subjectId === 'string' &&
           typeof value?.recordingId === 'string'
         );
@@ -657,15 +665,23 @@ export default function App() {
     if (job.recordingId === 'legacy-recording.m4a') {
       return {
         transcriptFile: paths.legacyTranscript,
+        translationFile: paths.legacyTranslation,
         summaryFile: paths.legacySummary,
       };
     }
     const base = stripAudioExtension(job.recordingId);
     return {
       transcriptFile: new File(paths.transcriptsDir, `${base}.txt`),
+      translationFile: new File(paths.translationsDir, `${base}.txt`),
       summaryFile: new File(paths.summariesDir, `${base}.txt`),
     };
   };
+
+  const jobActionText = (jobType: PendingJob['jobType']) =>
+    jobType === 'transcribe' ? '전사' : jobType === 'translate' ? '번역' : '요약';
+
+  const jobFailTitle = (jobType: PendingJob['jobType']) =>
+    jobType === 'transcribe' ? '전사 실패' : jobType === 'translate' ? '번역 실패' : '요약 실패';
 
   const pollPendingJobs = async () => {
     if (pollingRef.current || pendingJobs.length === 0) {
@@ -686,8 +702,8 @@ export default function App() {
                 `${job.fileName} 상태 조회 실패: ${message}. 서버 재시작/배포로 작업이 유실되었을 수 있어 다시 실행이 필요합니다.`,
               );
               await notifyLocal(
-                job.jobType === 'transcribe' ? '전사 실패' : '요약 실패',
-                `${job.fileName} ${job.jobType === 'transcribe' ? '전사' : '요약'} 작업이 서버에서 사라졌습니다.`,
+                jobFailTitle(job.jobType),
+                `${job.fileName} ${jobActionText(job.jobType)} 작업이 서버에서 사라졌습니다.`,
               );
               removePendingJob(job.jobId);
             } else {
@@ -707,6 +723,14 @@ export default function App() {
               }
               await notifyLocal('전사 완료', `${job.fileName} 전사가 완료되었습니다.`);
               setStatusMessage(`전사 완료 (${job.fileName})`);
+            } else if (job.jobType === 'translate') {
+              const value = typeof data?.translation === 'string' ? data.translation.trim() : '';
+              writeText(files.translationFile, value);
+              if (selectedRecordingId === job.recordingId) {
+                setTranslation(value);
+              }
+              await notifyLocal('번역 완료', `${job.fileName} 번역이 완료되었습니다.`);
+              setStatusMessage(`번역 완료 (${job.fileName})`);
             } else {
               const value = typeof data?.summary === 'string' ? data.summary.trim() : '';
               writeText(files.summaryFile, value);
@@ -726,12 +750,12 @@ export default function App() {
           if (status === 'failed') {
             const reason = typeof data?.error === 'string' ? data.error.trim() : '';
             const message = typeof data?.message === 'string' ? data.message.trim() : '';
-            const defaultMessage = `${job.fileName} ${job.jobType === 'transcribe' ? '전사' : '요약'} 실패`;
+            const defaultMessage = `${job.fileName} ${jobActionText(job.jobType)} 실패`;
             const detail = reason || message || '서버에서 상세 원인을 받지 못했습니다.';
             setStatusMessage(`${defaultMessage}: ${detail}`);
             await notifyLocal(
-              job.jobType === 'transcribe' ? '전사 실패' : '요약 실패',
-              `${job.fileName} ${job.jobType === 'transcribe' ? '전사' : '요약'} 실패: ${detail}`,
+              jobFailTitle(job.jobType),
+              `${job.fileName} ${jobActionText(job.jobType)} 실패: ${detail}`,
             );
             removePendingJob(job.jobId);
           }
@@ -756,6 +780,12 @@ export default function App() {
     setEditorVisible(true);
   };
 
+  const openTranslationEditor = () => {
+    setEditorTarget('translation');
+    setEditorText(translation);
+    setEditorVisible(true);
+  };
+
   const openRenameModal = () => {
     if (!selectedRecording) {
       setStatusMessage('이름 변경할 파일을 선택해주세요.');
@@ -774,13 +804,18 @@ export default function App() {
       if (editorTarget === 'transcript') {
         writeText(selectedRecording.transcriptFile, editorText);
         setTranscript(editorText);
+      } else if (editorTarget === 'translation') {
+        writeText(selectedRecording.translationFile, editorText);
+        setTranslation(editorText);
       } else {
         writeText(selectedRecording.summaryFile, editorText);
         setSummary(editorText);
       }
       await refreshSelectedSubject(selectedRecording.id);
       setEditorVisible(false);
-      setStatusMessage(editorTarget === 'transcript' ? '전사 내용 저장 완료' : '요약 내용 저장 완료');
+      setStatusMessage(
+        editorTarget === 'transcript' ? '전사 내용 저장 완료' : editorTarget === 'translation' ? '번역 내용 저장 완료' : '요약 내용 저장 완료',
+      );
     } catch (error) {
       setStatusMessage(`편집 저장 실패: ${formatError(error)}`);
     }
@@ -805,6 +840,9 @@ export default function App() {
             }
             if (selectedRecording.transcriptFile.exists) {
               selectedRecording.transcriptFile.delete();
+            }
+            if (selectedRecording.translationFile.exists) {
+              selectedRecording.translationFile.delete();
             }
             if (selectedRecording.summaryFile.exists) {
               selectedRecording.summaryFile.delete();
@@ -849,12 +887,14 @@ export default function App() {
 
       const nextRecordingFile = new File(paths.recordingsDir, nextRecordingName);
       const nextTranscriptFile = new File(paths.transcriptsDir, `${nextBaseName}.txt`);
+      const nextTranslationFile = new File(paths.translationsDir, `${nextBaseName}.txt`);
       const nextSummaryFile = new File(paths.summariesDir, `${nextBaseName}.txt`);
 
       const sameRecordingName = selectedRecording.recordingFile.name === nextRecordingName;
       const sameTranscriptName = selectedRecording.transcriptFile.name === `${nextBaseName}.txt`;
+      const sameTranslationName = selectedRecording.translationFile.name === `${nextBaseName}.txt`;
       const sameSummaryName = selectedRecording.summaryFile.name === `${nextBaseName}.txt`;
-      if (sameRecordingName && sameTranscriptName && sameSummaryName) {
+      if (sameRecordingName && sameTranscriptName && sameTranslationName && sameSummaryName) {
         setRenameVisible(false);
         setStatusMessage('파일 이름이 동일합니다.');
         return;
@@ -865,6 +905,9 @@ export default function App() {
       }
       if (!sameTranscriptName && nextTranscriptFile.exists) {
         throw new Error('같은 이름의 전사 파일이 이미 있습니다.');
+      }
+      if (!sameTranslationName && nextTranslationFile.exists) {
+        throw new Error('같은 이름의 번역 파일이 이미 있습니다.');
       }
       if (!sameSummaryName && nextSummaryFile.exists) {
         throw new Error('같은 이름의 요약 파일이 이미 있습니다.');
@@ -877,6 +920,10 @@ export default function App() {
       if (selectedRecording.transcriptFile.exists && !sameTranscriptName) {
         selectedRecording.transcriptFile.copy(nextTranscriptFile);
         selectedRecording.transcriptFile.delete();
+      }
+      if (selectedRecording.translationFile.exists && !sameTranslationName) {
+        selectedRecording.translationFile.copy(nextTranslationFile);
+        selectedRecording.translationFile.delete();
       }
       if (selectedRecording.summaryFile.exists && !sameSummaryName) {
         selectedRecording.summaryFile.copy(nextSummaryFile);
@@ -1293,6 +1340,160 @@ export default function App() {
     }
   };
 
+  const runTranslateApi = async () => {
+    if (!selectedSubject || !selectedRecording) {
+      setStatusMessage('번역할 파일을 선택해주세요.');
+      return;
+    }
+
+    const sourceTranscript = transcript.trim();
+    if (!sourceTranscript) {
+      setStatusMessage('먼저 전사 텍스트를 준비해주세요.');
+      return;
+    }
+
+    try {
+      setIsBusy(true);
+      setStatusMessage('API 번역 요청 중...');
+
+      const response = await fetch(`${apiBaseUrl}/api/jobs/translate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: sourceTranscript,
+          target_language: translationTargetLanguage,
+          mode: 'api',
+          file_name: selectedRecording.title,
+          expo_push_token: expoPushToken || undefined,
+        }),
+      });
+      const jobPayload = await readJsonSafely(response);
+      if (response.ok) {
+        const jobId = typeof jobPayload?.job_id === 'string' ? jobPayload.job_id : '';
+        if (!jobId) {
+          throw new Error('번역 잡 ID를 받지 못했습니다.');
+        }
+
+        addPendingJob({
+          jobId,
+          jobType: 'translate',
+          mode: 'api',
+          subjectId: selectedSubject.id,
+          recordingId: selectedRecording.id,
+          fileName: selectedRecording.title,
+        });
+        await notifyLocal('번역 시작', `${selectedRecording.title} 번역중`);
+        setStatusMessage(`번역 백그라운드 시작 (${selectedRecording.title})`);
+        return;
+      }
+
+      if (response.status !== 404) {
+        throw new Error(getApiErrorMessage(jobPayload, response, '번역 잡 생성 실패'));
+      }
+
+      const legacyResponse = await fetch(`${apiBaseUrl}/api/translate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: sourceTranscript,
+          target_language: translationTargetLanguage,
+        }),
+      });
+      const legacyPayload = await readJsonSafely(legacyResponse);
+      if (!legacyResponse.ok) {
+        throw new Error(getApiErrorMessage(legacyPayload, legacyResponse, '번역 실패'));
+      }
+
+      const value = typeof legacyPayload?.translation === 'string' ? legacyPayload.translation.trim() : '';
+      writeText(selectedRecording.translationFile, value);
+      setTranslation(value);
+      await refreshSelectedSubject(selectedRecording.id);
+      await notifyLocal('번역 완료', `${selectedRecording.title} 번역이 완료되었습니다.`);
+      setStatusMessage(`번역 완료 (${selectedRecording.title})`);
+    } catch (error) {
+      setStatusMessage(`번역 실패: ${formatError(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const runTranslateChatApi = async () => {
+    if (!selectedSubject || !selectedRecording) {
+      setStatusMessage('번역할 파일을 선택해주세요.');
+      return;
+    }
+
+    const sourceTranscript = transcript.trim();
+    if (!sourceTranscript) {
+      setStatusMessage('먼저 전사 텍스트를 준비해주세요.');
+      return;
+    }
+
+    try {
+      setIsBusy(true);
+      setStatusMessage('대화형 AI 번역 요청 중...');
+
+      const response = await fetch(`${apiBaseUrl}/api/jobs/translate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: sourceTranscript,
+          target_language: translationTargetLanguage,
+          mode: 'chat',
+          file_name: selectedRecording.title,
+          expo_push_token: expoPushToken || undefined,
+        }),
+      });
+      const jobPayload = await readJsonSafely(response);
+      if (response.ok) {
+        const jobId = typeof jobPayload?.job_id === 'string' ? jobPayload.job_id : '';
+        if (!jobId) {
+          throw new Error('번역 잡 ID를 받지 못했습니다.');
+        }
+
+        addPendingJob({
+          jobId,
+          jobType: 'translate',
+          mode: 'chat',
+          subjectId: selectedSubject.id,
+          recordingId: selectedRecording.id,
+          fileName: selectedRecording.title,
+        });
+        await notifyLocal('번역 시작', `${selectedRecording.title} 번역중`);
+        setStatusMessage(`번역 백그라운드 시작 (${selectedRecording.title})`);
+        return;
+      }
+
+      if (response.status !== 404) {
+        throw new Error(getApiErrorMessage(jobPayload, response, '대화형 번역 잡 생성 실패'));
+      }
+
+      const legacyResponse = await fetch(`${apiBaseUrl}/api/translate-chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: sourceTranscript,
+          target_language: translationTargetLanguage,
+        }),
+      });
+      const legacyPayload = await readJsonSafely(legacyResponse);
+      if (!legacyResponse.ok) {
+        throw new Error(getApiErrorMessage(legacyPayload, legacyResponse, '대화형 번역 실패'));
+      }
+
+      const value = typeof legacyPayload?.translation === 'string' ? legacyPayload.translation.trim() : '';
+      writeText(selectedRecording.translationFile, value);
+      setTranslation(value);
+      await refreshSelectedSubject(selectedRecording.id);
+      await notifyLocal('번역 완료', `${selectedRecording.title} 번역이 완료되었습니다.`);
+      setStatusMessage(`번역 완료 (${selectedRecording.title})`);
+    } catch (error) {
+      setStatusMessage(`대화형 번역 실패: ${formatError(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
   const runSummaryApi = async () => {
     if (!selectedSubject || !selectedRecording) {
       setStatusMessage('요약할 녹음 파일을 선택해주세요.');
@@ -1535,6 +1736,19 @@ export default function App() {
             );
             hasAny = true;
           }
+          if (item.translationFile.exists) {
+            const translationName = item.translationFile.name || `${stripAudioExtension(recordingName)}.txt`;
+            unitForm.append('translation_name', translationName);
+            unitForm.append(
+              'translation',
+              {
+                uri: item.translationFile.uri,
+                name: translationName,
+                type: 'text/plain',
+              } as any,
+            );
+            hasAny = true;
+          }
           if (item.summaryFile.exists) {
             const summaryName = item.summaryFile.name || `${stripAudioExtension(recordingName)}.txt`;
             unitForm.append('summary_name', summaryName);
@@ -1629,6 +1843,9 @@ export default function App() {
         const transcripts = Array.isArray(entry.transcripts)
           ? entry.transcripts.filter((value: unknown): value is string => typeof value === 'string')
           : [];
+        const translations = Array.isArray(entry.translations)
+          ? entry.translations.filter((value: unknown): value is string => typeof value === 'string')
+          : [];
         const summaries = Array.isArray(entry.summaries)
           ? entry.summaries.filter((value: unknown): value is string => typeof value === 'string')
           : [];
@@ -1652,6 +1869,18 @@ export default function App() {
           }
           await File.downloadFileAsync(
             `${apiBaseUrl}/api/library/file?subject_id=${encodeURIComponent(subjectId)}&kind=transcript&name=${encodeURIComponent(name)}`,
+            target,
+            { headers: getAuthHeaders() },
+          );
+          downloadedFiles += 1;
+        }
+        for (const name of translations) {
+          const target = new File(paths.translationsDir, name);
+          if (target.exists) {
+            target.delete();
+          }
+          await File.downloadFileAsync(
+            `${apiBaseUrl}/api/library/file?subject_id=${encodeURIComponent(subjectId)}&kind=translation&name=${encodeURIComponent(name)}`,
             target,
             { headers: getAuthHeaders() },
           );
@@ -1684,7 +1913,7 @@ export default function App() {
     }
   };
 
-  const exportSubjectFile = async (kind: 'recording' | 'transcript' | 'summary') => {
+  const exportSubjectFile = async (kind: 'recording' | 'transcript' | 'translation' | 'summary') => {
     if (!selectedSubject || !selectedRecording) {
       setStatusMessage('파일을 선택해주세요.');
       return;
@@ -1695,6 +1924,8 @@ export default function App() {
         ? selectedRecording.recordingFile
         : kind === 'transcript'
           ? selectedRecording.transcriptFile
+          : kind === 'translation'
+            ? selectedRecording.translationFile
           : selectedRecording.summaryFile;
 
     if (!target.exists) {
@@ -1735,6 +1966,7 @@ export default function App() {
         Math.max(recordings[0]?.updatedAt ?? 0, meta?.createdAt ?? 0, paths.meta.modificationTime ?? 0) || 0;
       const hasRecording = recordings.some((item) => item.recordingFile.exists);
       const hasTranscript = recordings.some((item) => item.transcriptFile.exists);
+      const hasTranslation = recordings.some((item) => item.translationFile.exists);
       const hasSummary = recordings.some((item) => item.summaryFile.exists);
 
       rows.push({
@@ -1745,6 +1977,7 @@ export default function App() {
         color: normalizeFolderColor(meta?.color ?? DEFAULT_FOLDER_COLOR),
         hasRecording,
         hasTranscript,
+        hasTranslation,
         hasSummary,
         updatedAt,
         previewFiles: recordings.slice(0, 3).map((item) => item.title),
@@ -1776,6 +2009,7 @@ export default function App() {
       setSelectedRecordingId(null);
       setRecordingUri(null);
       setTranscript('');
+      setTranslation('');
       setSummary('');
       return;
     }
@@ -1788,6 +2022,9 @@ export default function App() {
     const transcriptValue = picked.transcriptFile.exists ? await picked.transcriptFile.text() : '';
     setTranscript(transcriptValue);
 
+    const translationValue = picked.translationFile.exists ? await picked.translationFile.text() : '';
+    setTranslation(translationValue);
+
     const summaryValue = picked.summaryFile.exists ? await picked.summaryFile.text() : '';
     setSummary(summaryValue);
   };
@@ -1797,7 +2034,7 @@ export default function App() {
       <SafeAreaView style={styles.safeArea}>
         <ScrollView contentContainerStyle={styles.content}>
           <Text style={styles.title}>Campus Lecture Binder</Text>
-          <Text style={styles.subtitle}>폴더 → 파일 → 전사/요약 상세</Text>
+          <Text style={styles.subtitle}>폴더 → 파일 → 전사/번역/요약 상세</Text>
 
           {screenMode === 'home' ? (
             <View style={styles.card}>
@@ -1855,7 +2092,7 @@ export default function App() {
                     </View>
                     <Text style={styles.subjectMeta}>
                       {subject.hasRecording ? 'REC' : '-'} / {subject.hasTranscript ? 'TXT' : '-'} /{' '}
-                      {subject.hasSummary ? 'SUM' : '-'}
+                      {subject.hasTranslation ? 'TRN' : '-'} / {subject.hasSummary ? 'SUM' : '-'}
                     </Text>
                     {subject.previewFiles.length > 0 ? (
                       <View style={styles.previewFileList}>
@@ -1890,7 +2127,7 @@ export default function App() {
                     <Text style={styles.recordingTitle}>{item.title}</Text>
                     <Text style={styles.recordingMeta}>
                       {item.recordingFile.exists ? 'REC' : '-'} / {item.transcriptFile.exists ? 'TXT' : '-'} /{' '}
-                      {item.summaryFile.exists ? 'SUM' : '-'}
+                      {item.translationFile.exists ? 'TRN' : '-'} / {item.summaryFile.exists ? 'SUM' : '-'}
                     </Text>
                   </Pressable>
                 ))}
@@ -1977,6 +2214,49 @@ export default function App() {
               </View>
 
               <View style={styles.card}>
+                <Text style={styles.sectionTitle}>번역 방식 선택</Text>
+                <ModeToggle mode={translationMode} onChange={setTranslationMode} />
+                <View style={styles.toggleRow}>
+                  <Pressable
+                    style={[styles.toggleButton, translationTargetLanguage === 'English' && styles.toggleButtonActive]}
+                    onPress={() => setTranslationTargetLanguage('English')}
+                  >
+                    <Text style={styles.toggleText}>영어 번역</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.toggleButton, translationTargetLanguage === 'Korean' && styles.toggleButtonActive]}
+                    onPress={() => setTranslationTargetLanguage('Korean')}
+                  >
+                    <Text style={styles.toggleText}>한국어 번역</Text>
+                  </Pressable>
+                </View>
+                {translationMode === 'chat' ? (
+                  <Pressable
+                    style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                    onPress={runTranslateChatApi}
+                    disabled={!selectedRecording || isBusy}
+                  >
+                    <Text style={styles.actionButtonText}>대화형 AI 번역 실행</Text>
+                  </Pressable>
+                ) : (
+                  <Pressable
+                    style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                    onPress={runTranslateApi}
+                    disabled={!selectedRecording || isBusy}
+                  >
+                    <Text style={styles.actionButtonText}>API 번역 실행</Text>
+                  </Pressable>
+                )}
+                <View style={styles.previewRow}>
+                  <Text style={styles.previewTitle}>번역 내용 (최대 10줄)</Text>
+                  <Pressable style={styles.editChip} onPress={openTranslationEditor}>
+                    <Text style={styles.editChipText}>편집 +</Text>
+                  </Pressable>
+                </View>
+                <Text style={styles.bodyText}>{toTenLinePreview(translation, '번역 결과 없음')}</Text>
+              </View>
+
+              <View style={styles.card}>
                 <Text style={styles.sectionTitle}>요약 방식 선택</Text>
                 <ModeToggle mode={summaryMode} onChange={setSummaryMode} />
                 {summaryMode === 'chat' ? (
@@ -2010,7 +2290,7 @@ export default function App() {
                 <Text style={styles.apiInfo}>API: {apiBaseUrl}</Text>
                 {pendingJobs.length > 0 ? (
                   <Text style={styles.pendingInfo}>
-                    진행중 잡: {pendingJobs.map((job) => `${job.fileName} ${job.jobType === 'transcribe' ? '전사' : '요약'}`).join(', ')}
+                    진행중 잡: {pendingJobs.map((job) => `${job.fileName} ${jobActionText(job.jobType)}`).join(', ')}
                   </Text>
                 ) : null}
                 {isBusy ? <ActivityIndicator color="#2563EB" style={styles.loader} /> : null}
@@ -2078,7 +2358,9 @@ export default function App() {
       <Modal visible={editorVisible} transparent animationType="slide" onRequestClose={() => setEditorVisible(false)}>
         <View style={styles.modalOverlay}>
           <View style={[styles.modalCard, styles.editorModalCard]}>
-            <Text style={styles.modalTitle}>{editorTarget === 'summary' ? '요약 전체 편집' : '전사 전체 편집'}</Text>
+            <Text style={styles.modalTitle}>
+              {editorTarget === 'summary' ? '요약 전체 편집' : editorTarget === 'translation' ? '번역 전체 편집' : '전사 전체 편집'}
+            </Text>
             <TextInput
               value={editorText}
               onChangeText={setEditorText}
@@ -2113,7 +2395,7 @@ export default function App() {
               autoCapitalize="none"
               autoCorrect={false}
             />
-            <Text style={styles.helper}>녹음/전사/요약 파일명이 함께 변경됩니다.</Text>
+            <Text style={styles.helper}>녹음/전사/번역/요약 파일명이 함께 변경됩니다.</Text>
             <View style={styles.modalActions}>
               <Pressable style={[styles.modalButton, styles.modalCancel]} onPress={() => setRenameVisible(false)}>
                 <Text style={styles.modalButtonText}>취소</Text>
@@ -2425,15 +2707,18 @@ function getSubjectPaths(subjectId: string): SubjectPaths {
   const dir = new Directory(SUBJECTS_ROOT, subjectId);
   const recordingsDir = new Directory(dir, 'recordings');
   const transcriptsDir = new Directory(dir, 'transcripts');
+  const translationsDir = new Directory(dir, 'translations');
   const summariesDir = new Directory(dir, 'summaries');
   return {
     dir,
     meta: new File(dir, 'meta.json'),
     recordingsDir,
     transcriptsDir,
+    translationsDir,
     summariesDir,
     legacyRecording: new File(dir, 'recording.m4a'),
     legacyTranscript: new File(dir, 'transcript.txt'),
+    legacyTranslation: new File(dir, 'translation.txt'),
     legacySummary: new File(dir, 'summary.txt'),
   };
 }
@@ -2444,6 +2729,9 @@ function ensureRecordingDirs(paths: SubjectPaths) {
   }
   if (!paths.transcriptsDir.exists) {
     paths.transcriptsDir.create({ idempotent: true, intermediates: true });
+  }
+  if (!paths.translationsDir.exists) {
+    paths.translationsDir.create({ idempotent: true, intermediates: true });
   }
   if (!paths.summariesDir.exists) {
     paths.summariesDir.create({ idempotent: true, intermediates: true });
@@ -2477,15 +2765,22 @@ function listRecordingItems(paths: SubjectPaths): RecordingItem[] {
 
       const base = stripAudioExtension(entry.name);
       const transcriptFile = new File(paths.transcriptsDir, `${base}.txt`);
+      const translationFile = new File(paths.translationsDir, `${base}.txt`);
       const summaryFile = new File(paths.summariesDir, `${base}.txt`);
       const updatedAt =
-        Math.max(entry.modificationTime ?? 0, transcriptFile.modificationTime ?? 0, summaryFile.modificationTime ?? 0) || 0;
+        Math.max(
+          entry.modificationTime ?? 0,
+          transcriptFile.modificationTime ?? 0,
+          translationFile.modificationTime ?? 0,
+          summaryFile.modificationTime ?? 0,
+        ) || 0;
 
       items.push({
         id: entry.name,
         title: entry.name,
         recordingFile: entry,
         transcriptFile,
+        translationFile,
         summaryFile,
         updatedAt,
         isLegacy: false,
@@ -2498,6 +2793,7 @@ function listRecordingItems(paths: SubjectPaths): RecordingItem[] {
       Math.max(
         paths.legacyRecording.modificationTime ?? 0,
         paths.legacyTranscript.modificationTime ?? 0,
+        paths.legacyTranslation.modificationTime ?? 0,
         paths.legacySummary.modificationTime ?? 0,
       ) || 0;
     items.push({
@@ -2505,6 +2801,7 @@ function listRecordingItems(paths: SubjectPaths): RecordingItem[] {
       title: 'recording.m4a',
       recordingFile: paths.legacyRecording,
       transcriptFile: paths.legacyTranscript,
+      translationFile: paths.legacyTranslation,
       summaryFile: paths.legacySummary,
       updatedAt,
       isLegacy: true,

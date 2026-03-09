@@ -17,11 +17,23 @@ SYSTEM_SUMMARY_PROMPT = (
     "If any section has no data, write '없음'."
 )
 
+SYSTEM_TRANSLATE_PROMPT = (
+    "You are a precise lecture translator. "
+    "Translate only the provided text to the target language while preserving structure, terminology, and numbers. "
+    "Do not summarize or add new information. Return only translated text."
+)
+
 CHAT_TRANSCRIBE_PROMPT = (
     "너는 강의 전사 교정기다. "
     "요약하지 말고 전사문을 그대로 정리해라. "
     "내용 추가/삭제 금지, 고유명사/용어 유지, 영어 단어를 한글 발음으로 바꾸지 마라. "
     "띄어쓰기/문장부호/명백한 인식 오류만 교정해라."
+)
+
+CHAT_TRANSLATE_PROMPT = (
+    "너는 강의 번역 도우미다. "
+    "입력 텍스트를 목표 언어로만 번역해라. "
+    "요약/추측/추가 설명 금지, 문단 구조와 용어를 최대한 유지해라."
 )
 
 CHAT_SUMMARY_PROMPT = (
@@ -74,6 +86,21 @@ class OpenAIService:
         extracted = _extract_text_from_response(response)
         return extracted.strip() if extracted.strip() else "요약 생성 실패"
 
+    def translate_text(self, text: str, target_language: str) -> str:
+        target = _normalize_target_language(target_language)
+        response = self.client.responses.create(
+            model=self.settings.translation_model,
+            instructions=f"{SYSTEM_TRANSLATE_PROMPT} Target language: {target}.",
+            input=text,
+        )
+
+        output_text = getattr(response, "output_text", None)
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+        extracted = _extract_text_from_response(response)
+        return extracted.strip() if extracted.strip() else "번역 생성 실패"
+
     def transcribe_with_chat(self, file_path: str) -> str:
         raw = self.transcribe_file(file_path)
         try:
@@ -96,6 +123,21 @@ class OpenAIService:
         if not candidate:
             return raw
         return raw if _looks_like_bad_transcribe_refinement(raw, candidate) else candidate
+
+    def translate_with_chat(self, text: str, target_language: str) -> str:
+        target = _normalize_target_language(target_language)
+        response = self.client.responses.create(
+            model=self.settings.chat_translation_model,
+            instructions=f"{CHAT_TRANSLATE_PROMPT} 목표 언어: {target}.",
+            input=f"<TEXT>\n{text}\n</TEXT>",
+        )
+
+        output_text = getattr(response, "output_text", None)
+        if isinstance(output_text, str) and output_text.strip():
+            return _cleanup_translation_tags(output_text.strip())
+        extracted = _extract_text_from_response(response)
+        candidate = _cleanup_translation_tags(extracted.strip())
+        return candidate if candidate else "번역 생성 실패"
 
     def summarize_with_chat(self, transcript: str) -> str:
         response = self.client.responses.create(
@@ -256,9 +298,18 @@ def _cleanup_transcript_tags(text: str) -> str:
     return text.replace("<TRANSCRIPT>", "").replace("</TRANSCRIPT>", "").strip()
 
 
+def _cleanup_translation_tags(text: str) -> str:
+    return text.replace("<TEXT>", "").replace("</TEXT>", "").strip()
+
+
 def _looks_like_empty_summary(text: str) -> bool:
     normalized = text.replace(" ", "")
     return normalized.count("없음") >= 3
+
+
+def _normalize_target_language(value: str) -> str:
+    normalized = (value or "").strip()
+    return normalized[:40] if normalized else "English"
 
 
 def _should_retry_with_chunking(error: Exception) -> bool:

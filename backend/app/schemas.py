@@ -15,6 +15,15 @@ class SummarizeResponse(BaseModel):
     summary: str
 
 
+class TranslateRequest(BaseModel):
+    text: str = Field(min_length=1)
+    target_language: str = Field(default="English", min_length=2, max_length=40)
+
+
+class TranslateResponse(BaseModel):
+    translation: str
+
+
 class ProcessResponse(BaseModel):
     transcript: str
     summary: str
@@ -29,6 +38,14 @@ class LibrarySyncResponse(BaseModel):
 
 class AsyncSummarizeRequest(BaseModel):
     transcript: str = Field(min_length=1)
+    mode: Literal["api", "chat"] = "chat"
+    file_name: str | None = None
+    expo_push_token: str | None = None
+
+
+class AsyncTranslateRequest(BaseModel):
+    text: str = Field(min_length=1)
+    target_language: str = Field(default="English", min_length=2, max_length=40)
     mode: Literal["api", "chat"] = "chat"
     file_name: str | None = None
     expo_push_token: str | None = None
@@ -49,6 +66,7 @@ class JobStatusResponse(BaseModel):
     file_name: str
     message: str
     transcript: str | None = None
+    translation: str | None = None
     summary: str | None = None
     error: str | None = None
     created_at: float

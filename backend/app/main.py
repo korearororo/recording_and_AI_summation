@@ -24,12 +24,15 @@ from app.schemas import (
     AuthSessionResponse,
     AuthUser,
     AsyncSummarizeRequest,
+    AsyncTranslateRequest,
     JobCreateResponse,
     JobStatusResponse,
     LibrarySyncResponse,
     ProcessResponse,
     SummarizeRequest,
     SummarizeResponse,
+    TranslateRequest,
+    TranslateResponse,
     TranscriptionResponse,
 )
 from app.services.auth_store import AuthStore
@@ -291,10 +294,11 @@ def _subject_data_dir(target_dir: Path, kind: str) -> Path:
     mapping = {
         "recording": target_dir / "recordings",
         "transcript": target_dir / "transcripts",
+        "translation": target_dir / "translations",
         "summary": target_dir / "summaries",
     }
     if kind not in mapping:
-        raise HTTPException(status_code=400, detail="kind must be one of: recording, transcript, summary")
+        raise HTTPException(status_code=400, detail="kind must be one of: recording, transcript, translation, summary")
     data_dir = mapping[kind]
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir
@@ -336,6 +340,7 @@ def _create_job(job_type: str, mode: str, file_name: str, expo_push_token: str |
         "file_name": file_name,
         "message": f"{file_name} {job_type} 대기중",
         "transcript": None,
+        "translation": None,
         "summary": None,
         "error": None,
         "expo_push_token": expo_push_token or "",
@@ -476,6 +481,46 @@ def _run_summarize_job(job_id: str, transcript: str, mode: str, file_name: str, 
             "요약 실패",
             f"{file_name} 요약에 실패했습니다.",
             {"job_id": job_id, "job_type": "summarize", "status": "failed"},
+        )
+
+
+def _run_translate_job(
+    job_id: str,
+    text: str,
+    target_language: str,
+    mode: str,
+    file_name: str,
+    expo_push_token: str | None,
+) -> None:
+    _update_job(job_id, status="running", message=f"{file_name} 번역중")
+    _send_push_notification(
+        expo_push_token,
+        "번역 시작",
+        f"{file_name} 번역중",
+        {"job_id": job_id, "job_type": "translate", "status": "running"},
+    )
+
+    try:
+        service = OpenAIService()
+        if mode == "chat":
+            translation = service.translate_with_chat(text, target_language)
+        else:
+            translation = service.translate_text(text, target_language)
+
+        _update_job(job_id, status="completed", translation=translation, message=f"{file_name} 번역 완료")
+        _send_push_notification(
+            expo_push_token,
+            "번역 완료",
+            f"{file_name} 번역이 완료되었습니다.",
+            {"job_id": job_id, "job_type": "translate", "status": "completed"},
+        )
+    except Exception as exc:
+        _update_job(job_id, status="failed", error=f"{exc}", message=f"{file_name} 번역 실패")
+        _send_push_notification(
+            expo_push_token,
+            "번역 실패",
+            f"{file_name} 번역에 실패했습니다.",
+            {"job_id": job_id, "job_type": "translate", "status": "failed"},
         )
 
 
@@ -890,6 +935,32 @@ def summarize_text_with_chat(
         raise HTTPException(status_code=500, detail=f"Chat summarization failed: {exc}") from exc
 
 
+@app.post("/api/translate", response_model=TranslateResponse)
+def translate_text(
+    body: TranslateRequest,
+    _: None = Depends(_require_api_key),
+) -> TranslateResponse:
+    try:
+        service = OpenAIService()
+        translated = service.translate_text(body.text, body.target_language)
+        return TranslateResponse(translation=translated)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Translation failed: {exc}") from exc
+
+
+@app.post("/api/translate-chat", response_model=TranslateResponse)
+def translate_text_with_chat(
+    body: TranslateRequest,
+    _: None = Depends(_require_api_key),
+) -> TranslateResponse:
+    try:
+        service = OpenAIService()
+        translated = service.translate_with_chat(body.text, body.target_language)
+        return TranslateResponse(translation=translated)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Chat translation failed: {exc}") from exc
+
+
 @app.post("/api/process", response_model=ProcessResponse)
 def process_audio(
     file: UploadFile = File(...),
@@ -961,6 +1032,36 @@ def create_summarize_job(
     return JobCreateResponse(job_id=job_id, status="queued", job_type="summarize", message=f"{display_name} 요약중")
 
 
+@app.post("/api/jobs/translate", response_model=JobCreateResponse)
+def create_translate_job(
+    body: AsyncTranslateRequest,
+    _: None = Depends(_require_api_key),
+) -> JobCreateResponse:
+    selected_mode = (body.mode or "chat").strip().lower()
+    if selected_mode not in {"api", "chat"}:
+        raise HTTPException(status_code=400, detail="mode must be one of: api, chat")
+
+    display_name = (body.file_name or "selected-file").strip()
+    job = _create_job("translate", selected_mode, display_name, body.expo_push_token)
+    job_id = str(job["job_id"])
+
+    try:
+        JOB_EXECUTOR.submit(
+            _run_translate_job,
+            job_id,
+            body.text,
+            body.target_language,
+            selected_mode,
+            display_name,
+            body.expo_push_token,
+        )
+    except Exception as exc:
+        _update_job(job_id, status="failed", error=f"{exc}", message=f"{display_name} 번역 실패")
+        raise HTTPException(status_code=500, detail=f"Failed to enqueue translate job: {exc}") from exc
+
+    return JobCreateResponse(job_id=job_id, status="queued", job_type="translate", message=f"{display_name} 번역중")
+
+
 @app.get("/api/jobs/{job_id}", response_model=JobStatusResponse)
 def get_job_status(job_id: str, _: None = Depends(_require_api_key)) -> JobStatusResponse:
     job = _get_job(job_id)
@@ -975,6 +1076,7 @@ def get_job_status(job_id: str, _: None = Depends(_require_api_key)) -> JobStatu
         file_name=str(job.get("file_name") or "unknown"),
         message=str(job.get("message") or ""),
         transcript=job.get("transcript") if isinstance(job.get("transcript"), str) else None,
+        translation=job.get("translation") if isinstance(job.get("translation"), str) else None,
         summary=job.get("summary") if isinstance(job.get("summary"), str) else None,
         error=job.get("error") if isinstance(job.get("error"), str) else None,
         created_at=float(job.get("created_at") or _now_ts()),
@@ -991,9 +1093,11 @@ def sync_subject_files_to_library(
     subject_color: str | None = Form(default=None),
     recording_name: str | None = Form(default=None),
     transcript_name: str | None = Form(default=None),
+    translation_name: str | None = Form(default=None),
     summary_name: str | None = Form(default=None),
     recording: UploadFile | None = File(default=None),
     transcript: UploadFile | None = File(default=None),
+    translation: UploadFile | None = File(default=None),
     summary: UploadFile | None = File(default=None),
     settings: Settings = Depends(get_settings),
     current_user: dict[str, str] = Depends(_require_user),
@@ -1012,6 +1116,11 @@ def sync_subject_files_to_library(
             transcript_target = _subject_data_dir(target_dir, "transcript") / file_name
             _copy_upload_to(transcript, transcript_target)
             saved_files.append(f"transcripts/{file_name}")
+        if translation is not None:
+            file_name = _safe_file_name(translation_name or translation.filename or "translation.txt", "translation.txt")
+            translation_target = _subject_data_dir(target_dir, "translation") / file_name
+            _copy_upload_to(translation, translation_target)
+            saved_files.append(f"translations/{file_name}")
         if summary is not None:
             file_name = _safe_file_name(summary_name or summary.filename or "summary.txt", "summary.txt")
             summary_target = _subject_data_dir(target_dir, "summary") / file_name
@@ -1046,6 +1155,8 @@ def sync_subject_files_to_library(
             recording.file.close()
         if transcript is not None:
             transcript.file.close()
+        if translation is not None:
+            translation.file.close()
         if summary is not None:
             summary.file.close()
 
@@ -1063,12 +1174,16 @@ def list_library(
             continue
         recordings_dir = entry / "recordings"
         transcripts_dir = entry / "transcripts"
+        translations_dir = entry / "translations"
         summaries_dir = entry / "summaries"
         meta = _load_subject_meta(entry)
 
         recordings = sorted([p.name for p in recordings_dir.iterdir() if p.is_file()]) if recordings_dir.exists() else []
         transcripts = (
             sorted([p.name for p in transcripts_dir.iterdir() if p.is_file()]) if transcripts_dir.exists() else []
+        )
+        translations = (
+            sorted([p.name for p in translations_dir.iterdir() if p.is_file()]) if translations_dir.exists() else []
         )
         summaries = sorted([p.name for p in summaries_dir.iterdir() if p.is_file()]) if summaries_dir.exists() else []
         subject_id = str(meta.get("id") or entry.name.split("__")[-1])
@@ -1084,9 +1199,11 @@ def list_library(
                 "subject_color": str(meta.get("color") or ""),
                 "recording": len(recordings) > 0,
                 "transcript": len(transcripts) > 0,
+                "translation": len(translations) > 0,
                 "summary": len(summaries) > 0,
                 "recordings": recordings,
                 "transcripts": transcripts,
+                "translations": translations,
                 "summaries": summaries,
             }
         )
