@@ -185,6 +185,8 @@ export default function App() {
   const [editorVisible, setEditorVisible] = useState(false);
   const [editorTarget, setEditorTarget] = useState<'transcript' | 'translation' | 'summary' | null>(null);
   const [editorText, setEditorText] = useState('');
+  const [editorOriginalText, setEditorOriginalText] = useState('');
+  const [editorIsEditing, setEditorIsEditing] = useState(false);
   const [renameVisible, setRenameVisible] = useState(false);
   const [renameText, setRenameText] = useState('');
   const [expoPushToken, setExpoPushToken] = useState('');
@@ -768,22 +770,41 @@ export default function App() {
     }
   };
 
-  const openTranscriptEditor = () => {
-    setEditorTarget('transcript');
-    setEditorText(transcript);
+  const closeEditorModal = () => {
+    setEditorVisible(false);
+    setEditorIsEditing(false);
+  };
+
+  const openFullTextViewer = (target: 'transcript' | 'translation' | 'summary', value: string) => {
+    setEditorTarget(target);
+    setEditorText(value);
+    setEditorOriginalText(value);
+    setEditorIsEditing(false);
     setEditorVisible(true);
+  };
+
+  const openTranscriptEditor = () => {
+    openFullTextViewer('transcript', transcript);
   };
 
   const openSummaryEditor = () => {
-    setEditorTarget('summary');
-    setEditorText(summary);
-    setEditorVisible(true);
+    openFullTextViewer('summary', summary);
   };
 
   const openTranslationEditor = () => {
-    setEditorTarget('translation');
-    setEditorText(translation);
-    setEditorVisible(true);
+    openFullTextViewer('translation', translation);
+  };
+
+  const startEditorEditing = () => {
+    if (!editorTarget) {
+      return;
+    }
+    setEditorIsEditing(true);
+  };
+
+  const cancelEditorEditing = () => {
+    setEditorText(editorOriginalText);
+    setEditorIsEditing(false);
   };
 
   const openRenameModal = () => {
@@ -812,7 +833,8 @@ export default function App() {
         setSummary(editorText);
       }
       await refreshSelectedSubject(selectedRecording.id);
-      setEditorVisible(false);
+      setEditorOriginalText(editorText);
+      closeEditorModal();
       setStatusMessage(
         editorTarget === 'transcript' ? '전사 내용 저장 완료' : editorTarget === 'translation' ? '번역 내용 저장 완료' : '요약 내용 저장 완료',
       );
@@ -2207,7 +2229,7 @@ export default function App() {
                 <View style={styles.previewRow}>
                   <Text style={styles.previewTitle}>전사 내용 (최대 10줄)</Text>
                   <Pressable style={styles.editChip} onPress={openTranscriptEditor}>
-                    <Text style={styles.editChipText}>편집 +</Text>
+                    <Text style={styles.editChipText}>+</Text>
                   </Pressable>
                 </View>
                 <Text style={styles.bodyText}>{toTenLinePreview(transcript, '전사 결과 없음')}</Text>
@@ -2250,7 +2272,7 @@ export default function App() {
                 <View style={styles.previewRow}>
                   <Text style={styles.previewTitle}>번역 내용 (최대 10줄)</Text>
                   <Pressable style={styles.editChip} onPress={openTranslationEditor}>
-                    <Text style={styles.editChipText}>편집 +</Text>
+                    <Text style={styles.editChipText}>+</Text>
                   </Pressable>
                 </View>
                 <Text style={styles.bodyText}>{toTenLinePreview(translation, '번역 결과 없음')}</Text>
@@ -2279,7 +2301,7 @@ export default function App() {
                 <View style={styles.previewRow}>
                   <Text style={styles.previewTitle}>요약 내용 (최대 10줄)</Text>
                   <Pressable style={styles.editChip} onPress={openSummaryEditor}>
-                    <Text style={styles.editChipText}>편집 +</Text>
+                    <Text style={styles.editChipText}>+</Text>
                   </Pressable>
                 </View>
                 <Text style={styles.bodyText}>{toTenLinePreview(summary, '요약 결과 없음')}</Text>
@@ -2355,28 +2377,59 @@ export default function App() {
         ) : null}
       </SafeAreaView>
 
-      <Modal visible={editorVisible} transparent animationType="slide" onRequestClose={() => setEditorVisible(false)}>
+      <Modal visible={editorVisible} transparent animationType="slide" onRequestClose={closeEditorModal}>
         <View style={styles.modalOverlay}>
           <View style={[styles.modalCard, styles.editorModalCard]}>
-            <Text style={styles.modalTitle}>
-              {editorTarget === 'summary' ? '요약 전체 편집' : editorTarget === 'translation' ? '번역 전체 편집' : '전사 전체 편집'}
-            </Text>
-            <TextInput
-              value={editorText}
-              onChangeText={setEditorText}
-              multiline
-              scrollEnabled
-              style={styles.modalInput}
-              placeholder="내용을 입력하세요"
-              placeholderTextColor="#94A3B8"
-            />
+            <View style={styles.editorHeader}>
+              <Text style={styles.modalTitle}>
+                {editorTarget === 'summary'
+                  ? editorIsEditing
+                    ? '요약 편집'
+                    : '요약 전체 보기'
+                  : editorTarget === 'translation'
+                    ? editorIsEditing
+                      ? '번역 편집'
+                      : '번역 전체 보기'
+                    : editorIsEditing
+                      ? '전사 편집'
+                      : '전사 전체 보기'}
+              </Text>
+              {!editorIsEditing ? (
+                <Pressable style={styles.editorHeaderButton} onPress={startEditorEditing}>
+                  <Text style={styles.editorHeaderButtonText}>편집</Text>
+                </Pressable>
+              ) : null}
+            </View>
+            {editorIsEditing ? (
+              <TextInput
+                value={editorText}
+                onChangeText={setEditorText}
+                multiline
+                scrollEnabled
+                style={styles.modalInput}
+                placeholder="내용을 입력하세요"
+                placeholderTextColor="#94A3B8"
+              />
+            ) : (
+              <ScrollView style={styles.viewerScroll} contentContainerStyle={styles.viewerContent}>
+                <Text style={styles.viewerText}>{editorText.trim() || '내용이 없습니다.'}</Text>
+              </ScrollView>
+            )}
             <View style={styles.modalActions}>
-              <Pressable style={[styles.modalButton, styles.modalCancel]} onPress={() => setEditorVisible(false)}>
-                <Text style={styles.modalButtonText}>취소</Text>
-              </Pressable>
-              <Pressable style={[styles.modalButton, styles.modalSave]} onPress={() => void saveEditedText()}>
-                <Text style={styles.modalButtonText}>저장</Text>
-              </Pressable>
+              {editorIsEditing ? (
+                <>
+                  <Pressable style={[styles.modalButton, styles.modalCancel]} onPress={cancelEditorEditing}>
+                    <Text style={styles.modalButtonText}>취소</Text>
+                  </Pressable>
+                  <Pressable style={[styles.modalButton, styles.modalSave]} onPress={() => void saveEditedText()}>
+                    <Text style={styles.modalButtonText}>저장</Text>
+                  </Pressable>
+                </>
+              ) : (
+                <Pressable style={[styles.modalButton, styles.modalSave]} onPress={closeEditorModal}>
+                  <Text style={styles.modalButtonText}>닫기</Text>
+                </Pressable>
+              )}
             </View>
           </View>
         </View>
@@ -3510,6 +3563,26 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     marginBottom: 10,
   },
+  editorHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  editorHeaderButton: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#93C5FD',
+    backgroundColor: '#EEF6FF',
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    marginBottom: 10,
+  },
+  editorHeaderButtonText: {
+    color: '#1E3A8A',
+    fontSize: 12,
+    fontWeight: '700',
+  },
   modalLabel: {
     marginTop: 8,
     marginBottom: 6,
@@ -3618,6 +3691,22 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 9,
     textAlignVertical: 'top',
+  },
+  viewerScroll: {
+    maxHeight: 420,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    backgroundColor: '#F8FAFC',
+  },
+  viewerContent: {
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+  },
+  viewerText: {
+    color: '#0F172A',
+    fontSize: 13,
+    lineHeight: 21,
   },
   renameInput: {
     minHeight: 44,
