@@ -48,7 +48,12 @@ class OpenAIService:
         max_upload_bytes = self.settings.transcribe_max_file_mb * 1024 * 1024
 
         if source_path.stat().st_size <= max_upload_bytes:
-            return self._transcribe_single_file(source_path)
+            try:
+                return self._transcribe_single_file(source_path)
+            except Exception as exc:
+                if _should_retry_with_chunking(exc):
+                    return self._transcribe_large_file(source_path, max_upload_bytes)
+                raise
 
         return self._transcribe_large_file(source_path, max_upload_bytes)
 
@@ -245,3 +250,8 @@ def _cleanup_transcript_tags(text: str) -> str:
 def _looks_like_empty_summary(text: str) -> bool:
     normalized = text.replace(" ", "")
     return normalized.count("없음") >= 3
+
+
+def _should_retry_with_chunking(error: Exception) -> bool:
+    message = str(error).lower()
+    return "input_too_large" in message or "too large for this model" in message

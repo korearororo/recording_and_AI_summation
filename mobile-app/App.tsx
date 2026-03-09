@@ -725,11 +725,13 @@ export default function App() {
 
           if (status === 'failed') {
             const reason = typeof data?.error === 'string' ? data.error.trim() : '';
+            const message = typeof data?.message === 'string' ? data.message.trim() : '';
             const defaultMessage = `${job.fileName} ${job.jobType === 'transcribe' ? '전사' : '요약'} 실패`;
-            setStatusMessage(reason ? `${defaultMessage}: ${reason}` : defaultMessage);
+            const detail = reason || message || '서버에서 상세 원인을 받지 못했습니다.';
+            setStatusMessage(`${defaultMessage}: ${detail}`);
             await notifyLocal(
               job.jobType === 'transcribe' ? '전사 실패' : '요약 실패',
-              `${job.fileName} ${job.jobType === 'transcribe' ? '전사' : '요약'} 실패`,
+              `${job.fileName} ${job.jobType === 'transcribe' ? '전사' : '요약'} 실패: ${detail}`,
             );
             removePendingJob(job.jobId);
           }
