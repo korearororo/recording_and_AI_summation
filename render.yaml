@@ -12,6 +12,10 @@ services:
         sync: false
       - key: ALLOWED_ORIGINS
         value: "*"
+      - key: JOB_STORE_PATH
+        value: "jobs/jobs.json"
+      - key: JOB_STORE_MAX_ITEMS
+        value: "1000"
       - key: AUTH_PUBLIC_BASE_URL
         value: "https://recording-ai-backend.onrender.com"
       - key: AUTH_MOBILE_REDIRECT_URI

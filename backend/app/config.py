@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     openai_max_retries: int = Field(default=1, alias="OPENAI_MAX_RETRIES")
     allowed_origins: str = Field(default="*", alias="ALLOWED_ORIGINS")
     library_root: str = Field(default="library", alias="LIBRARY_ROOT")
+    job_store_path: str = Field(default="jobs/jobs.json", alias="JOB_STORE_PATH")
+    job_store_max_items: int = Field(default=1000, alias="JOB_STORE_MAX_ITEMS")
     auth_db_path: str = Field(default="auth/auth.db", alias="AUTH_DB_PATH")
     auth_session_hours: int = Field(default=24 * 30, alias="AUTH_SESSION_HOURS")
     auth_public_base_url: str = Field(default="", alias="AUTH_PUBLIC_BASE_URL")

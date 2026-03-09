@@ -40,6 +40,7 @@ app = FastAPI(title="Recording & AI Summary API", version="0.1.0")
 JOB_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 JOB_LOCK = Lock()
 JOBS: dict[str, dict[str, object]] = {}
+JOB_STORE_BOOTSTRAPPED = False
 AUTH_LOCK = Lock()
 AUTH_STORE: AuthStore | None = None
 SUPPORTED_OAUTH_PROVIDERS = {"google", "kakao", "naver"}
@@ -58,6 +59,11 @@ def _configure_cors(settings: Settings) -> None:
 _configure_cors(get_settings())
 
 
+@app.on_event("startup")
+def _bootstrap_persistent_state() -> None:
+    _bootstrap_job_store(get_settings())
+
+
 def _require_api_key(settings: Settings = Depends(get_settings)) -> None:
     if not settings.openai_api_key:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is missing")
@@ -68,6 +74,113 @@ def _resolve_auth_db_path(settings: Settings) -> Path:
     if not path.is_absolute():
         path = Path(__file__).resolve().parents[1] / path
     return path
+
+
+def _resolve_job_store_path(settings: Settings) -> Path:
+    path = Path(settings.job_store_path)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[1] / path
+    return path
+
+
+def _clone_jobs(source: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
+    return {job_id: dict(value) for job_id, value in source.items()}
+
+
+def _prune_jobs_locked(settings: Settings) -> None:
+    limit = max(50, settings.job_store_max_items)
+    if len(JOBS) <= limit:
+        return
+
+    sortable = sorted(
+        (
+            float(value.get("updated_at") or 0.0),
+            str(value.get("status") or ""),
+            job_id,
+        )
+        for job_id, value in JOBS.items()
+    )
+
+    # Prefer pruning terminal jobs first; keep queued/running jobs when possible.
+    for _, status, job_id in sortable:
+        if len(JOBS) <= limit:
+            break
+        if status in {"completed", "failed"}:
+            JOBS.pop(job_id, None)
+
+    # If still above the limit, prune oldest jobs regardless of status.
+    for _, _, job_id in sortable:
+        if len(JOBS) <= limit:
+            break
+        JOBS.pop(job_id, None)
+
+
+def _write_jobs_snapshot(settings: Settings, snapshot: dict[str, dict[str, object]]) -> None:
+    target = _resolve_job_store_path(settings)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_target = target.with_suffix(f"{target.suffix}.tmp")
+    temp_target.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+    temp_target.replace(target)
+
+
+def _try_write_jobs_snapshot(settings: Settings, snapshot: dict[str, dict[str, object]]) -> None:
+    try:
+        _write_jobs_snapshot(settings, snapshot)
+    except Exception:
+        # Keep serving requests even when local disk persistence temporarily fails.
+        pass
+
+
+def _load_jobs(settings: Settings) -> None:
+    target = _resolve_job_store_path(settings)
+    if not target.exists():
+        return
+
+    try:
+        parsed = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    if not isinstance(parsed, dict):
+        return
+
+    loaded: dict[str, dict[str, object]] = {}
+    now = _now_ts()
+    has_recovered_jobs = False
+    for raw_job_id, raw_value in parsed.items():
+        if not isinstance(raw_job_id, str) or not isinstance(raw_value, dict):
+            continue
+        item = dict(raw_value)
+        item["job_id"] = raw_job_id
+        status = str(item.get("status") or "failed")
+        if status in {"queued", "running"}:
+            item["status"] = "failed"
+            item["error"] = "Job interrupted by server restart."
+            file_name = str(item.get("file_name") or "file")
+            item["message"] = f"{file_name} processing interrupted (server restart)"
+            item["updated_at"] = now
+            has_recovered_jobs = True
+        loaded[raw_job_id] = item
+
+    with JOB_LOCK:
+        JOBS.clear()
+        JOBS.update(loaded)
+        _prune_jobs_locked(settings)
+        snapshot = _clone_jobs(JOBS)
+
+    if has_recovered_jobs:
+        _try_write_jobs_snapshot(settings, snapshot)
+
+
+def _bootstrap_job_store(settings: Settings) -> None:
+    global JOB_STORE_BOOTSTRAPPED
+    if JOB_STORE_BOOTSTRAPPED:
+        return
+    with JOB_LOCK:
+        if JOB_STORE_BOOTSTRAPPED:
+            return
+        JOB_STORE_BOOTSTRAPPED = True
+    _load_jobs(settings)
 
 
 def _get_auth_store(settings: Settings) -> AuthStore:
@@ -210,6 +323,9 @@ def _now_ts() -> float:
 
 
 def _create_job(job_type: str, mode: str, file_name: str, expo_push_token: str | None) -> dict[str, object]:
+    settings = get_settings()
+    _bootstrap_job_store(settings)
+
     job_id = str(uuid.uuid4())
     now = _now_ts()
     record: dict[str, object] = {
@@ -228,19 +344,30 @@ def _create_job(job_type: str, mode: str, file_name: str, expo_push_token: str |
     }
     with JOB_LOCK:
         JOBS[job_id] = record
+        _prune_jobs_locked(settings)
+        snapshot = _clone_jobs(JOBS)
+    _try_write_jobs_snapshot(settings, snapshot)
     return record
 
 
 def _update_job(job_id: str, **kwargs: object) -> None:
+    settings = get_settings()
+    _bootstrap_job_store(settings)
+
     with JOB_LOCK:
         item = JOBS.get(job_id)
         if item is None:
             return
         item.update(kwargs)
         item["updated_at"] = _now_ts()
+        _prune_jobs_locked(settings)
+        snapshot = _clone_jobs(JOBS)
+    _try_write_jobs_snapshot(settings, snapshot)
 
 
 def _get_job(job_id: str) -> dict[str, object] | None:
+    _bootstrap_job_store(get_settings())
+
     with JOB_LOCK:
         item = JOBS.get(job_id)
         if item is None:

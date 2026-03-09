@@ -208,10 +208,11 @@ export default function App() {
       ? process.env.EXPO_PUBLIC_API_BASE_URL_ANDROID
       : process.env.EXPO_PUBLIC_API_BASE_URL_IOS) ??
     FALLBACK_API_URL;
+  const normalizedApiBaseUrl = normalizeApiBaseUrl(rawApiBaseUrl, FALLBACK_API_URL);
   const apiBaseUrl =
-    Platform.OS === 'android' && Constants.isDevice && rawApiBaseUrl.includes('10.0.2.2')
+    Platform.OS === 'android' && Constants.isDevice && normalizedApiBaseUrl.includes('10.0.2.2')
       ? PROD_API_URL
-      : rawApiBaseUrl;
+      : normalizedApiBaseUrl;
 
   const getAuthHeaders = (): Record<string, string> => {
     if (!authToken) {
@@ -675,9 +676,23 @@ export default function App() {
     try {
       for (const job of pendingJobs) {
         try {
-          const response = await fetch(`${apiBaseUrl}/api/jobs/${job.jobId}`);
+          const jobStatusUrl = `${apiBaseUrl}/api/jobs/${job.jobId}`;
+          const response = await fetch(jobStatusUrl);
           const data = await readJsonSafely(response);
           if (!response.ok) {
+            const message = getApiErrorMessage(data, response, '작업 상태 조회 실패', jobStatusUrl);
+            if (response.status === 404) {
+              setStatusMessage(
+                `${job.fileName} 상태 조회 실패: ${message}. 서버 재시작/배포로 작업이 유실되었을 수 있어 다시 실행이 필요합니다.`,
+              );
+              await notifyLocal(
+                job.jobType === 'transcribe' ? '전사 실패' : '요약 실패',
+                `${job.fileName} ${job.jobType === 'transcribe' ? '전사' : '요약'} 작업이 서버에서 사라졌습니다.`,
+              );
+              removePendingJob(job.jobId);
+            } else {
+              setStatusMessage(`${job.fileName} 상태 조회 실패: ${message}`);
+            }
             continue;
           }
 
@@ -691,6 +706,7 @@ export default function App() {
                 setTranscript(value);
               }
               await notifyLocal('전사 완료', `${job.fileName} 전사가 완료되었습니다.`);
+              setStatusMessage(`전사 완료 (${job.fileName})`);
             } else {
               const value = typeof data?.summary === 'string' ? data.summary.trim() : '';
               writeText(files.summaryFile, value);
@@ -698,6 +714,7 @@ export default function App() {
                 setSummary(value);
               }
               await notifyLocal('요약 완료', `${job.fileName} 요약이 완료되었습니다.`);
+              setStatusMessage(`요약 완료 (${job.fileName})`);
             }
             removePendingJob(job.jobId);
             if (selectedSubjectId === job.subjectId) {
@@ -707,14 +724,17 @@ export default function App() {
           }
 
           if (status === 'failed') {
+            const reason = typeof data?.error === 'string' ? data.error.trim() : '';
+            const defaultMessage = `${job.fileName} ${job.jobType === 'transcribe' ? '전사' : '요약'} 실패`;
+            setStatusMessage(reason ? `${defaultMessage}: ${reason}` : defaultMessage);
             await notifyLocal(
               job.jobType === 'transcribe' ? '전사 실패' : '요약 실패',
               `${job.fileName} ${job.jobType === 'transcribe' ? '전사' : '요약'} 실패`,
             );
             removePendingJob(job.jobId);
           }
-        } catch {
-          // Ignore polling error for this cycle.
+        } catch (error) {
+          setStatusMessage(`${job.fileName} 상태 조회 오류: ${formatError(error)}`);
         }
       }
     } finally {
@@ -1104,7 +1124,8 @@ export default function App() {
         formData.append('expo_push_token', expoPushToken);
       }
 
-      const response = await fetch(`${apiBaseUrl}/api/jobs/transcribe`, {
+      const createJobUrl = `${apiBaseUrl}/api/jobs/transcribe`;
+      const response = await fetch(createJobUrl, {
         method: 'POST',
         body: formData,
       });
@@ -1129,7 +1150,7 @@ export default function App() {
       }
 
       if (response.status !== 404) {
-        throw new Error(getApiErrorMessage(jobPayload, response, '전사 잡 생성 실패'));
+        throw new Error(getApiErrorMessage(jobPayload, response, '전사 잡 생성 실패', createJobUrl));
       }
 
       const legacyForm = new FormData();
@@ -1141,13 +1162,14 @@ export default function App() {
           type: 'audio/m4a',
         } as any,
       );
-      const legacyResponse = await fetch(`${apiBaseUrl}/api/transcribe`, {
+      const legacyUrl = `${apiBaseUrl}/api/transcribe`;
+      const legacyResponse = await fetch(legacyUrl, {
         method: 'POST',
         body: legacyForm,
       });
       const legacyPayload = await readJsonSafely(legacyResponse);
       if (!legacyResponse.ok) {
-        throw new Error(getApiErrorMessage(legacyPayload, legacyResponse, '전사 실패'));
+        throw new Error(getApiErrorMessage(legacyPayload, legacyResponse, '전사 실패', legacyUrl));
       }
 
       const transcriptValue = typeof legacyPayload?.transcript === 'string' ? legacyPayload.transcript.trim() : '';
@@ -1205,7 +1227,8 @@ export default function App() {
         formData.append('expo_push_token', expoPushToken);
       }
 
-      const response = await fetch(`${apiBaseUrl}/api/jobs/transcribe`, {
+      const createJobUrl = `${apiBaseUrl}/api/jobs/transcribe`;
+      const response = await fetch(createJobUrl, {
         method: 'POST',
         body: formData,
       });
@@ -1230,7 +1253,7 @@ export default function App() {
       }
 
       if (response.status !== 404) {
-        throw new Error(getApiErrorMessage(jobPayload, response, '대화형 전사 잡 생성 실패'));
+        throw new Error(getApiErrorMessage(jobPayload, response, '대화형 전사 잡 생성 실패', createJobUrl));
       }
 
       const legacyForm = new FormData();
@@ -1242,13 +1265,14 @@ export default function App() {
           type: 'audio/m4a',
         } as any,
       );
-      const legacyResponse = await fetch(`${apiBaseUrl}/api/transcribe-chat`, {
+      const legacyUrl = `${apiBaseUrl}/api/transcribe-chat`;
+      const legacyResponse = await fetch(legacyUrl, {
         method: 'POST',
         body: legacyForm,
       });
       const legacyPayload = await readJsonSafely(legacyResponse);
       if (!legacyResponse.ok) {
-        throw new Error(getApiErrorMessage(legacyPayload, legacyResponse, '대화형 전사 실패'));
+        throw new Error(getApiErrorMessage(legacyPayload, legacyResponse, '대화형 전사 실패', legacyUrl));
       }
 
       const transcriptValue = typeof legacyPayload?.transcript === 'string' ? legacyPayload.transcript.trim() : '';
@@ -2626,17 +2650,46 @@ async function readJsonSafely(response: Response): Promise<any> {
   }
 }
 
-function getApiErrorMessage(payload: any, response: Response, fallback: string): string {
+function normalizeApiBaseUrl(value: string, fallback: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return fallback;
+  }
+
+  let normalized = trimmed.replace(/\/+$/, '');
+  normalized = normalized.replace(/\/health$/i, '');
+  normalized = normalized.replace(/\/api$/i, '');
+  normalized = normalized.replace(/\/+$/, '');
+  return normalized || fallback;
+}
+
+function compactRequestUrl(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return '';
+  }
+  try {
+    const parsed = new URL(trimmed);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return trimmed;
+  }
+}
+
+function getApiErrorMessage(payload: any, response: Response, fallback: string, requestUrl?: string): string {
+  const target = compactRequestUrl(requestUrl || response.url || '');
+  const withTarget = (message: string) => (target ? `${message} (${response.status} @ ${target})` : `${message} (${response.status})`);
+
   if (typeof payload?.detail === 'string' && payload.detail.trim()) {
-    return payload.detail.trim();
+    return withTarget(payload.detail.trim());
   }
   if (typeof payload?.error === 'string' && payload.error.trim()) {
-    return payload.error.trim();
+    return withTarget(payload.error.trim());
   }
   if (typeof payload?.raw === 'string' && payload.raw.trim()) {
-    return payload.raw.trim();
+    return withTarget(payload.raw.trim());
   }
-  return `${fallback} (${response.status})`;
+  return withTarget(fallback);
 }
 
 function formatError(error: unknown): string {
