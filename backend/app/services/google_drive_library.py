@@ -52,10 +52,6 @@ class GoogleDriveLibraryStore:
         oauth_client_secret: str,
         oauth_refresh_token: str,
     ):
-        if service_account_json.strip():
-            info = self._load_service_account_info(service_account_json)
-            return service_account.Credentials.from_service_account_info(info, scopes=DRIVE_SCOPES)
-
         client_id = oauth_client_id.strip()
         client_secret = oauth_client_secret.strip()
         refresh_token = oauth_refresh_token.strip()
@@ -70,6 +66,10 @@ class GoogleDriveLibraryStore:
             )
             creds.refresh(Request())
             return creds
+
+        if service_account_json.strip():
+            info = self._load_service_account_info(service_account_json)
+            return service_account.Credentials.from_service_account_info(info, scopes=DRIVE_SCOPES)
 
         raise ValueError(
             "Google Drive credentials are missing. "
