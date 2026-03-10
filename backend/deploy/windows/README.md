@@ -34,8 +34,11 @@ Open PowerShell as Administrator, then run:
   -OpenAIApiKey "sk-..." `
   -AuthDatabaseUrl "postgresql://user:pass@host:5432/dbname?sslmode=require" `
   -GoogleDriveEnabled $true `
-  -GoogleDriveServiceAccountJson "{...json...}" `
+  -GoogleDriveServiceAccountJson "{...json...}" ` # or OAuth settings below
   -GoogleDriveRootFolderId "1AbCdEfGh..." `
+  -GoogleDriveOAuthClientId "..." `
+  -GoogleDriveOAuthClientSecret "..." `
+  -GoogleDriveOAuthRefreshToken "..." `
   -InstallFfmpeg
 ```
 
@@ -43,7 +46,9 @@ Notes:
 - `-InstallFfmpeg` is recommended for long audio chunking support.
 - Caddy is installed via winget if missing (unless `-SkipCaddyInstall` is used).
 - `-AuthDatabaseUrl` is optional. If set, login data is stored in persistent PostgreSQL.
-- `-GoogleDriveEnabled`, `-GoogleDriveServiceAccountJson` can enable Google Drive library storage.
+- `-GoogleDriveEnabled` with either:
+  - service account JSON (`-GoogleDriveServiceAccountJson`), or
+  - OAuth refresh token (`-GoogleDriveOAuthClientId/Secret/RefreshToken`).
 
 ## 2) Verify
 

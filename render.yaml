@@ -27,6 +27,12 @@ services:
         sync: false
       - key: GOOGLE_DRIVE_ROOT_FOLDER_ID
         sync: false
+      - key: GOOGLE_DRIVE_OAUTH_CLIENT_ID
+        sync: false
+      - key: GOOGLE_DRIVE_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN
+        sync: false
       - key: JOB_STORE_PATH
         value: "jobs/jobs.json"
       - key: JOB_STORE_MAX_ITEMS

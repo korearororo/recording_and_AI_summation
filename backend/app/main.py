@@ -211,7 +211,13 @@ def _get_auth_store(settings: Settings) -> AuthStore | AuthStorePostgres:
 
 
 def _use_google_drive_library(settings: Settings) -> bool:
-    return settings.google_drive_enabled and bool(settings.google_drive_service_account_json.strip())
+    has_service_account = bool(settings.google_drive_service_account_json.strip())
+    has_oauth = bool(
+        settings.google_drive_oauth_client_id.strip()
+        and settings.google_drive_oauth_client_secret.strip()
+        and settings.google_drive_oauth_refresh_token.strip()
+    )
+    return settings.google_drive_enabled and (has_service_account or has_oauth)
 
 
 def _get_google_drive_store(settings: Settings) -> GoogleDriveLibraryStore:
@@ -222,6 +228,9 @@ def _get_google_drive_store(settings: Settings) -> GoogleDriveLibraryStore:
                 DRIVE_STORE = GoogleDriveLibraryStore(
                     service_account_json=settings.google_drive_service_account_json,
                     root_folder_id=settings.google_drive_root_folder_id,
+                    oauth_client_id=settings.google_drive_oauth_client_id,
+                    oauth_client_secret=settings.google_drive_oauth_client_secret,
+                    oauth_refresh_token=settings.google_drive_oauth_refresh_token,
                 )
     return DRIVE_STORE
 

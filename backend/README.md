@@ -20,7 +20,10 @@ If you want to use the app from any network (not only your home/PC LAN), deploy 
    - `ALLOWED_ORIGINS=*` (or your exact app origin list)
    - `AUTH_DATABASE_URL=<postgres connection string>` (recommended for persistent login DB)
    - `GOOGLE_DRIVE_ENABLED=true` (if you want library storage in Google Drive)
-   - `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON=<service account json string or file path>`
+   - `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON=<service account json string or file path>` OR OAuth below
+   - `GOOGLE_DRIVE_OAUTH_CLIENT_ID=<oauth client id>`
+   - `GOOGLE_DRIVE_OAUTH_CLIENT_SECRET=<oauth client secret>`
+   - `GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN=<oauth refresh token>`
    - `GOOGLE_DRIVE_ROOT_FOLDER_ID=<optional drive folder id>`
    - `AUTH_PUBLIC_BASE_URL=https://<your-backend-domain>`
    - `AUTH_MOBILE_REDIRECT_URI=meetingnoteai://auth/callback`
@@ -65,12 +68,24 @@ cd backend\deploy\windows
     - Root folder: `GOOGLE_DRIVE_ROOT_FOLDER_ID` (or auto-created `RecordingAI-Library`)
     - Per-user folder: `user_<user_id>`
     - Per-subject folder: `<subject_name>__<subject_id>/recordings|transcripts|translations|summaries`
+    - Auth options:
+      - Service account JSON (best with Shared Drive)
+      - OAuth refresh token (recommended for personal Google Drive)
 
 ### Google Drive Service Account Note
 - `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` can be:
   - Full JSON string itself, or
   - Absolute file path to a JSON file (self-hosted Windows/Linux)
 - On Render, set it as secret env var with the full JSON string.
+- If you see `storageQuotaExceeded` with service account, switch to OAuth refresh token mode.
+
+### Generate Drive OAuth Refresh Token
+```bash
+cd backend
+python scripts/get_google_drive_refresh_token.py \
+  --client-id "<GOOGLE_DRIVE_OAUTH_CLIENT_ID>" \
+  --client-secret "<GOOGLE_DRIVE_OAUTH_CLIENT_SECRET>"
+```
 
 ## Optional: Migrate Existing SQLite Auth Data to PostgreSQL
 If users already signed up on SQLite and you want to keep those accounts:

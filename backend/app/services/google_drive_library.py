@@ -5,7 +5,9 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from google.auth.transport.requests import Request
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
@@ -22,15 +24,58 @@ class UploadPayload:
 
 
 class GoogleDriveLibraryStore:
-    def __init__(self, service_account_json: str, root_folder_id: str = "") -> None:
-        info = self._load_service_account_info(service_account_json)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=DRIVE_SCOPES)
+    def __init__(
+        self,
+        service_account_json: str = "",
+        root_folder_id: str = "",
+        oauth_client_id: str = "",
+        oauth_client_secret: str = "",
+        oauth_refresh_token: str = "",
+    ) -> None:
+        creds = self._build_credentials(
+            service_account_json=service_account_json,
+            oauth_client_id=oauth_client_id,
+            oauth_client_secret=oauth_client_secret,
+            oauth_refresh_token=oauth_refresh_token,
+        )
         self._drive = build("drive", "v3", credentials=creds, cache_discovery=False)
         root_id = root_folder_id.strip()
         if root_id:
             self._root_folder_id = root_id
         else:
             self._root_folder_id = self._find_or_create_folder("root", "RecordingAI-Library")
+
+    def _build_credentials(
+        self,
+        service_account_json: str,
+        oauth_client_id: str,
+        oauth_client_secret: str,
+        oauth_refresh_token: str,
+    ):
+        if service_account_json.strip():
+            info = self._load_service_account_info(service_account_json)
+            return service_account.Credentials.from_service_account_info(info, scopes=DRIVE_SCOPES)
+
+        client_id = oauth_client_id.strip()
+        client_secret = oauth_client_secret.strip()
+        refresh_token = oauth_refresh_token.strip()
+        if client_id and client_secret and refresh_token:
+            creds = Credentials(
+                token=None,
+                refresh_token=refresh_token,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=client_id,
+                client_secret=client_secret,
+                scopes=DRIVE_SCOPES,
+            )
+            creds.refresh(Request())
+            return creds
+
+        raise ValueError(
+            "Google Drive credentials are missing. "
+            "Set GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON or OAuth settings "
+            "(GOOGLE_DRIVE_OAUTH_CLIENT_ID/SECRET/REFRESH_TOKEN)."
+        )
 
     def sync_subject(
         self,
