@@ -19,6 +19,9 @@ If you want to use the app from any network (not only your home/PC LAN), deploy 
    - `OPENAI_API_KEY=<your key>`
    - `ALLOWED_ORIGINS=*` (or your exact app origin list)
    - `AUTH_DATABASE_URL=<postgres connection string>` (recommended for persistent login DB)
+   - `GOOGLE_DRIVE_ENABLED=true` (if you want library storage in Google Drive)
+   - `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON=<service account json string or file path>`
+   - `GOOGLE_DRIVE_ROOT_FOLDER_ID=<optional drive folder id>`
    - `AUTH_PUBLIC_BASE_URL=https://<your-backend-domain>`
    - `AUTH_MOBILE_REDIRECT_URI=meetingnoteai://auth/callback`
    - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
@@ -55,9 +58,19 @@ cd backend\deploy\windows
   - If `AUTH_DATABASE_URL` is set: PostgreSQL (persistent)
   - Otherwise: local SQLite `backend/auth/auth.db` (can be ephemeral on free cloud instances)
 - Uploaded library files:
-  - `LIBRARY_ROOT` (default `backend/library`)
-  - Per-user folder: `library/user_<user_id>/`
-  - Per-subject folder: `<subject_name>__<subject_id>/recordings|transcripts|translations|summaries`
+  - Local mode (default): `LIBRARY_ROOT` (default `backend/library`)
+    - Per-user folder: `library/user_<user_id>/`
+    - Per-subject folder: `<subject_name>__<subject_id>/recordings|transcripts|translations|summaries`
+  - Google Drive mode (`GOOGLE_DRIVE_ENABLED=true`):
+    - Root folder: `GOOGLE_DRIVE_ROOT_FOLDER_ID` (or auto-created `RecordingAI-Library`)
+    - Per-user folder: `user_<user_id>`
+    - Per-subject folder: `<subject_name>__<subject_id>/recordings|transcripts|translations|summaries`
+
+### Google Drive Service Account Note
+- `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` can be:
+  - Full JSON string itself, or
+  - Absolute file path to a JSON file (self-hosted Windows/Linux)
+- On Render, set it as secret env var with the full JSON string.
 
 ## Optional: Migrate Existing SQLite Auth Data to PostgreSQL
 If users already signed up on SQLite and you want to keep those accounts:

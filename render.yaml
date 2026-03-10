@@ -19,6 +19,14 @@ services:
         sync: false
       - key: ALLOWED_ORIGINS
         value: "*"
+      - key: LIBRARY_ROOT
+        value: "library"
+      - key: GOOGLE_DRIVE_ENABLED
+        value: "false"
+      - key: GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: GOOGLE_DRIVE_ROOT_FOLDER_ID
+        sync: false
       - key: JOB_STORE_PATH
         value: "jobs/jobs.json"
       - key: JOB_STORE_MAX_ITEMS

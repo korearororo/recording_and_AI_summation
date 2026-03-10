@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -15,7 +16,7 @@ from urllib import request as urllib_request
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 
 from app.config import Settings, get_settings
 from app.schemas import (
@@ -37,6 +38,7 @@ from app.schemas import (
 )
 from app.services.auth_store import AuthStore
 from app.services.auth_store_postgres import AuthStorePostgres
+from app.services.google_drive_library import GoogleDriveLibraryStore, UploadPayload
 from app.services.openai_service import OpenAIService
 
 app = FastAPI(title="Recording & AI Summary API", version="0.1.0")
@@ -47,6 +49,8 @@ JOBS: dict[str, dict[str, object]] = {}
 JOB_STORE_BOOTSTRAPPED = False
 AUTH_LOCK = Lock()
 AUTH_STORE: AuthStore | AuthStorePostgres | None = None
+DRIVE_LOCK = Lock()
+DRIVE_STORE: GoogleDriveLibraryStore | None = None
 SUPPORTED_OAUTH_PROVIDERS = {"google", "kakao", "naver"}
 
 
@@ -204,6 +208,22 @@ def _get_auth_store(settings: Settings) -> AuthStore | AuthStorePostgres:
                         session_ttl_hours=settings.auth_session_hours,
                     )
     return AUTH_STORE
+
+
+def _use_google_drive_library(settings: Settings) -> bool:
+    return settings.google_drive_enabled and bool(settings.google_drive_service_account_json.strip())
+
+
+def _get_google_drive_store(settings: Settings) -> GoogleDriveLibraryStore:
+    global DRIVE_STORE
+    if DRIVE_STORE is None:
+        with DRIVE_LOCK:
+            if DRIVE_STORE is None:
+                DRIVE_STORE = GoogleDriveLibraryStore(
+                    service_account_json=settings.google_drive_service_account_json,
+                    root_folder_id=settings.google_drive_root_folder_id,
+                )
+    return DRIVE_STORE
 
 
 def _extract_bearer_token(authorization: str | None) -> str:
@@ -1099,6 +1119,7 @@ def sync_subject_files_to_library(
     subject_tag: str | None = Form(default=None),
     subject_icon: str | None = Form(default=None),
     subject_color: str | None = Form(default=None),
+    subject_order: str | None = Form(default=None),
     recording_name: str | None = Form(default=None),
     transcript_name: str | None = Form(default=None),
     translation_name: str | None = Form(default=None),
@@ -1110,50 +1131,113 @@ def sync_subject_files_to_library(
     settings: Settings = Depends(get_settings),
     current_user: dict[str, str] = Depends(_require_user),
 ) -> LibrarySyncResponse:
-    target_dir = _subject_library_dir(settings, subject_id, subject_name, current_user["id"])
     saved_files: list[str] = []
 
     try:
-        if recording is not None:
-            file_name = _safe_file_name(recording_name or recording.filename or "recording.m4a", "recording.m4a")
-            recording_target = _subject_data_dir(target_dir, "recording") / file_name
-            _copy_upload_to(recording, recording_target)
-            saved_files.append(f"recordings/{file_name}")
-        if transcript is not None:
-            file_name = _safe_file_name(transcript_name or transcript.filename or "transcript.txt", "transcript.txt")
-            transcript_target = _subject_data_dir(target_dir, "transcript") / file_name
-            _copy_upload_to(transcript, transcript_target)
-            saved_files.append(f"transcripts/{file_name}")
-        if translation is not None:
-            file_name = _safe_file_name(translation_name or translation.filename or "translation.txt", "translation.txt")
-            translation_target = _subject_data_dir(target_dir, "translation") / file_name
-            _copy_upload_to(translation, translation_target)
-            saved_files.append(f"translations/{file_name}")
-        if summary is not None:
-            file_name = _safe_file_name(summary_name or summary.filename or "summary.txt", "summary.txt")
-            summary_target = _subject_data_dir(target_dir, "summary") / file_name
-            _copy_upload_to(summary, summary_target)
-            saved_files.append(f"summaries/{file_name}")
+        if _use_google_drive_library(settings):
+            drive_store = _get_google_drive_store(settings)
+            uploads: list[UploadPayload] = []
+            if recording is not None:
+                file_name = _safe_file_name(recording_name or recording.filename or "recording.m4a", "recording.m4a")
+                uploads.append(
+                    UploadPayload(
+                        kind="recording",
+                        file_name=file_name,
+                        content=recording.file.read(),
+                        content_type=recording.content_type or "audio/m4a",
+                    )
+                )
+            if transcript is not None:
+                file_name = _safe_file_name(transcript_name or transcript.filename or "transcript.txt", "transcript.txt")
+                uploads.append(
+                    UploadPayload(
+                        kind="transcript",
+                        file_name=file_name,
+                        content=transcript.file.read(),
+                        content_type=transcript.content_type or "text/plain",
+                    )
+                )
+            if translation is not None:
+                file_name = _safe_file_name(translation_name or translation.filename or "translation.txt", "translation.txt")
+                uploads.append(
+                    UploadPayload(
+                        kind="translation",
+                        file_name=file_name,
+                        content=translation.file.read(),
+                        content_type=translation.content_type or "text/plain",
+                    )
+                )
+            if summary is not None:
+                file_name = _safe_file_name(summary_name or summary.filename or "summary.txt", "summary.txt")
+                uploads.append(
+                    UploadPayload(
+                        kind="summary",
+                        file_name=file_name,
+                        content=summary.file.read(),
+                        content_type=summary.content_type or "text/plain",
+                    )
+                )
 
-        meta = _load_subject_meta(target_dir)
-        if not meta.get("created_at"):
-            meta["created_at"] = _now_ts()
-        meta.update(
-            {
+            meta = {
                 "id": subject_id,
                 "name": subject_name,
                 "tag": subject_tag or "",
-                "icon": subject_icon or meta.get("icon") or "",
-                "color": subject_color or meta.get("color") or "",
+                "icon": subject_icon or "",
+                "color": subject_color or "",
+                "order": subject_order or "",
                 "updated_at": _now_ts(),
             }
-        )
-        _save_subject_meta(target_dir, meta)
+            target_dir, saved_files = drive_store.sync_subject(
+                user_id=current_user["id"],
+                subject_id=subject_id,
+                subject_name=subject_name,
+                meta=meta,
+                uploads=uploads,
+            )
+        else:
+            target_dir = _subject_library_dir(settings, subject_id, subject_name, current_user["id"])
+
+            if recording is not None:
+                file_name = _safe_file_name(recording_name or recording.filename or "recording.m4a", "recording.m4a")
+                recording_target = _subject_data_dir(target_dir, "recording") / file_name
+                _copy_upload_to(recording, recording_target)
+                saved_files.append(f"recordings/{file_name}")
+            if transcript is not None:
+                file_name = _safe_file_name(transcript_name or transcript.filename or "transcript.txt", "transcript.txt")
+                transcript_target = _subject_data_dir(target_dir, "transcript") / file_name
+                _copy_upload_to(transcript, transcript_target)
+                saved_files.append(f"transcripts/{file_name}")
+            if translation is not None:
+                file_name = _safe_file_name(translation_name or translation.filename or "translation.txt", "translation.txt")
+                translation_target = _subject_data_dir(target_dir, "translation") / file_name
+                _copy_upload_to(translation, translation_target)
+                saved_files.append(f"translations/{file_name}")
+            if summary is not None:
+                file_name = _safe_file_name(summary_name or summary.filename or "summary.txt", "summary.txt")
+                summary_target = _subject_data_dir(target_dir, "summary") / file_name
+                _copy_upload_to(summary, summary_target)
+                saved_files.append(f"summaries/{file_name}")
+
+            meta = _load_subject_meta(target_dir)
+            if not meta.get("created_at"):
+                meta["created_at"] = _now_ts()
+            meta.update(
+                {
+                    "id": subject_id,
+                    "name": subject_name,
+                    "tag": subject_tag or "",
+                    "icon": subject_icon or meta.get("icon") or "",
+                    "color": subject_color or meta.get("color") or "",
+                    "order": subject_order or meta.get("order") or "",
+                    "updated_at": _now_ts(),
+                }
+            )
+            _save_subject_meta(target_dir, meta)
 
         return LibrarySyncResponse(
             subject_id=subject_id,
             subject_name=subject_name,
-            target_dir=str(target_dir.resolve()),
+            target_dir=target_dir if isinstance(target_dir, str) else str(target_dir.resolve()),
             saved_files=saved_files,
         )
     except Exception as exc:
@@ -1174,6 +1258,10 @@ def list_library(
     settings: Settings = Depends(get_settings),
     current_user: dict[str, str] = Depends(_require_user),
 ) -> dict[str, object]:
+    if _use_google_drive_library(settings):
+        drive_store = _get_google_drive_store(settings)
+        return drive_store.list_subjects(current_user["id"])
+
     root = _resolve_library_root(settings, current_user["id"])
     subjects: list[dict[str, object]] = []
 
@@ -1205,6 +1293,7 @@ def list_library(
                 "subject_tag": str(meta.get("tag") or ""),
                 "subject_icon": str(meta.get("icon") or ""),
                 "subject_color": str(meta.get("color") or ""),
+                "subject_order": str(meta.get("order") or ""),
                 "recording": len(recordings) > 0,
                 "transcript": len(transcripts) > 0,
                 "translation": len(translations) > 0,
@@ -1226,6 +1315,25 @@ def download_library_file(
     name: str = Query(...),
     settings: Settings = Depends(get_settings),
     current_user: dict[str, str] = Depends(_require_user),
-) -> FileResponse:
+) -> Response:
+    if _use_google_drive_library(settings):
+        drive_store = _get_google_drive_store(settings)
+        try:
+            content, filename, content_type = drive_store.download_subject_file(
+                user_id=current_user["id"],
+                subject_id=subject_id,
+                kind=kind,
+                file_name=name,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Drive file download failed: {exc}") from exc
+
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return StreamingResponse(io.BytesIO(content), media_type=content_type, headers=headers)
+
     target = _resolve_library_file(settings, current_user["id"], subject_id, kind, name)
     return FileResponse(path=str(target), filename=target.name, media_type="application/octet-stream")

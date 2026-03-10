@@ -4,3 +4,5 @@ python-multipart==0.0.20
 openai==1.109.1
 pydantic-settings==2.10.1
 psycopg[binary]==3.2.9
+google-api-python-client==2.168.0
+google-auth==2.40.3

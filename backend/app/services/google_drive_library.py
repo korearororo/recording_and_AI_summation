@@ -1,0 +1,321 @@
+from __future__ import annotations
+
+import io
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+
+FOLDER_MIME = "application/vnd.google-apps.folder"
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+
+@dataclass
+class UploadPayload:
+    kind: str
+    file_name: str
+    content: bytes
+    content_type: str
+
+
+class GoogleDriveLibraryStore:
+    def __init__(self, service_account_json: str, root_folder_id: str = "") -> None:
+        info = self._load_service_account_info(service_account_json)
+        creds = service_account.Credentials.from_service_account_info(info, scopes=DRIVE_SCOPES)
+        self._drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+        root_id = root_folder_id.strip()
+        if root_id:
+            self._root_folder_id = root_id
+        else:
+            self._root_folder_id = self._find_or_create_folder("root", "RecordingAI-Library")
+
+    def sync_subject(
+        self,
+        user_id: str,
+        subject_id: str,
+        subject_name: str,
+        meta: dict[str, object],
+        uploads: list[UploadPayload],
+    ) -> tuple[str, list[str]]:
+        user_folder_id = self._find_or_create_folder(self._root_folder_id, f"user_{self._safe_segment(user_id)}")
+        subject_folder_id = self._find_or_create_subject_folder(user_folder_id, subject_id, subject_name)
+
+        saved_files: list[str] = []
+        kind_to_dir = {
+            "recording": "recordings",
+            "transcript": "transcripts",
+            "translation": "translations",
+            "summary": "summaries",
+        }
+
+        for payload in uploads:
+            if payload.kind not in kind_to_dir:
+                continue
+            subdir_name = kind_to_dir[payload.kind]
+            subdir_id = self._find_or_create_folder(subject_folder_id, subdir_name)
+            self._upload_or_replace_file(
+                parent_id=subdir_id,
+                file_name=payload.file_name,
+                content=payload.content,
+                content_type=payload.content_type,
+            )
+            saved_files.append(f"{subdir_name}/{payload.file_name}")
+
+        meta_bytes = json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
+        self._upload_or_replace_file(
+            parent_id=subject_folder_id,
+            file_name="meta.json",
+            content=meta_bytes,
+            content_type="application/json",
+        )
+
+        return f"drive://folder/{subject_folder_id}", saved_files
+
+    def list_subjects(self, user_id: str) -> dict[str, object]:
+        user_folder_name = f"user_{self._safe_segment(user_id)}"
+        user_folder = self._find_folder(self._root_folder_id, user_folder_name)
+        if user_folder is None:
+            return {"root_dir": f"drive://folder/{self._root_folder_id}", "subjects": []}
+
+        user_folder_id = str(user_folder["id"])
+        subjects: list[dict[str, object]] = []
+        for folder in self._list_child_folders(user_folder_id):
+            folder_name = str(folder.get("name") or "")
+            subject_folder_id = str(folder["id"])
+            meta = self._read_meta_json(subject_folder_id)
+
+            recordings = self._list_files_in_subfolder(subject_folder_id, "recordings")
+            transcripts = self._list_files_in_subfolder(subject_folder_id, "transcripts")
+            translations = self._list_files_in_subfolder(subject_folder_id, "translations")
+            summaries = self._list_files_in_subfolder(subject_folder_id, "summaries")
+
+            subject_id = str(meta.get("id") or folder_name.split("__")[-1] or folder_name)
+            subject_name = str(meta.get("name") or subject_id)
+            subjects.append(
+                {
+                    "folder": folder_name,
+                    "path": f"drive://folder/{subject_folder_id}",
+                    "subject_id": subject_id,
+                    "subject_name": subject_name,
+                    "subject_tag": str(meta.get("tag") or ""),
+                    "subject_icon": str(meta.get("icon") or ""),
+                    "subject_color": str(meta.get("color") or ""),
+                    "subject_order": str(meta.get("order") or ""),
+                    "recording": len(recordings) > 0,
+                    "transcript": len(transcripts) > 0,
+                    "translation": len(translations) > 0,
+                    "summary": len(summaries) > 0,
+                    "recordings": recordings,
+                    "transcripts": transcripts,
+                    "translations": translations,
+                    "summaries": summaries,
+                }
+            )
+
+        subjects.sort(key=lambda item: str(item.get("folder") or ""))
+        return {"root_dir": f"drive://folder/{user_folder_id}", "subjects": subjects}
+
+    def download_subject_file(self, user_id: str, subject_id: str, kind: str, file_name: str) -> tuple[bytes, str, str]:
+        user_folder = self._find_folder(self._root_folder_id, f"user_{self._safe_segment(user_id)}")
+        if user_folder is None:
+            raise FileNotFoundError("user folder not found")
+        user_folder_id = str(user_folder["id"])
+
+        subject_folder = self._find_subject_folder(user_folder_id, subject_id)
+        if subject_folder is None:
+            raise FileNotFoundError("subject not found")
+        subject_folder_id = str(subject_folder["id"])
+
+        kind_to_dir = {
+            "recording": "recordings",
+            "transcript": "transcripts",
+            "translation": "translations",
+            "summary": "summaries",
+        }
+        subfolder_name = kind_to_dir.get(kind)
+        if not subfolder_name:
+            raise ValueError("kind must be one of: recording, transcript, translation, summary")
+        subfolder = self._find_folder(subject_folder_id, subfolder_name)
+        if subfolder is None:
+            raise FileNotFoundError("kind folder not found")
+
+        subfolder_id = str(subfolder["id"])
+        target_file = self._find_file(subfolder_id, file_name)
+        if target_file is None:
+            raise FileNotFoundError("file not found")
+
+        file_id = str(target_file["id"])
+        content = self._download_file(file_id)
+        content_type = str(target_file.get("mimeType") or "application/octet-stream")
+        return content, file_name, content_type
+
+    def _load_service_account_info(self, raw: str) -> dict[str, object]:
+        value = raw.strip()
+        if not value:
+            raise ValueError("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON is empty")
+        if value.startswith("{"):
+            parsed = json.loads(value)
+            if not isinstance(parsed, dict):
+                raise ValueError("service account JSON must be an object")
+            return parsed
+
+        file_path = Path(value).expanduser().resolve()
+        if not file_path.exists():
+            raise ValueError("service account JSON path does not exist")
+        parsed = json.loads(file_path.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("service account file must contain an object")
+        return parsed
+
+    def _safe_segment(self, value: str) -> str:
+        cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", " ") else "_" for ch in value)
+        collapsed = "_".join(cleaned.split())
+        return (collapsed[:80] or "untitled").strip("_")
+
+    def _escape_query(self, value: str) -> str:
+        return value.replace("\\", "\\\\").replace("'", "\\'")
+
+    def _list_child_folders(self, parent_id: str) -> list[dict[str, object]]:
+        query = (
+            f"'{self._escape_query(parent_id)}' in parents and trashed = false "
+            f"and mimeType = '{FOLDER_MIME}'"
+        )
+        return self._list_files(query, fields="files(id,name)")
+
+    def _list_files(self, query: str, fields: str) -> list[dict[str, object]]:
+        items: list[dict[str, object]] = []
+        page_token: str | None = None
+        while True:
+            response = (
+                self._drive.files()
+                .list(
+                    q=query,
+                    spaces="drive",
+                    fields=f"nextPageToken,{fields}",
+                    includeItemsFromAllDrives=True,
+                    supportsAllDrives=True,
+                    pageSize=1000,
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+            files = response.get("files", [])
+            if isinstance(files, list):
+                for entry in files:
+                    if isinstance(entry, dict):
+                        items.append(entry)
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+        return items
+
+    def _find_folder(self, parent_id: str, name: str) -> dict[str, object] | None:
+        escaped_parent = self._escape_query(parent_id)
+        escaped_name = self._escape_query(name)
+        query = (
+            f"'{escaped_parent}' in parents and trashed = false and mimeType = '{FOLDER_MIME}' "
+            f"and name = '{escaped_name}'"
+        )
+        items = self._list_files(query, fields="files(id,name)")
+        return items[0] if items else None
+
+    def _find_or_create_folder(self, parent_id: str, name: str) -> str:
+        existing = self._find_folder(parent_id, name)
+        if existing is not None:
+            return str(existing["id"])
+
+        body = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
+        created = (
+            self._drive.files()
+            .create(body=body, fields="id,name", supportsAllDrives=True)
+            .execute()
+        )
+        return str(created["id"])
+
+    def _find_subject_folder(self, user_folder_id: str, subject_id: str) -> dict[str, object] | None:
+        suffix = f"__{self._safe_segment(subject_id)}"
+        for folder in self._list_child_folders(user_folder_id):
+            name = str(folder.get("name") or "")
+            if name.endswith(suffix):
+                return folder
+        return None
+
+    def _find_or_create_subject_folder(self, user_folder_id: str, subject_id: str, subject_name: str) -> str:
+        existing = self._find_subject_folder(user_folder_id, subject_id)
+        if existing is not None:
+            return str(existing["id"])
+        folder_name = f"{self._safe_segment(subject_name or subject_id)}__{self._safe_segment(subject_id)}"
+        return self._find_or_create_folder(user_folder_id, folder_name)
+
+    def _find_file(self, parent_id: str, file_name: str) -> dict[str, object] | None:
+        escaped_parent = self._escape_query(parent_id)
+        escaped_name = self._escape_query(file_name)
+        query = (
+            f"'{escaped_parent}' in parents and trashed = false and mimeType != '{FOLDER_MIME}' "
+            f"and name = '{escaped_name}'"
+        )
+        items = self._list_files(query, fields="files(id,name,mimeType)")
+        return items[0] if items else None
+
+    def _upload_or_replace_file(self, parent_id: str, file_name: str, content: bytes, content_type: str) -> str:
+        existing = self._find_file(parent_id, file_name)
+        media = MediaIoBaseUpload(io.BytesIO(content), mimetype=content_type or "application/octet-stream", resumable=False)
+        if existing is not None:
+            updated = (
+                self._drive.files()
+                .update(
+                    fileId=str(existing["id"]),
+                    media_body=media,
+                    fields="id",
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
+            return str(updated["id"])
+
+        body = {"name": file_name, "parents": [parent_id]}
+        created = (
+            self._drive.files()
+            .create(body=body, media_body=media, fields="id", supportsAllDrives=True)
+            .execute()
+        )
+        return str(created["id"])
+
+    def _download_file(self, file_id: str) -> bytes:
+        request = self._drive.files().get_media(fileId=file_id, supportsAllDrives=True)
+        output = io.BytesIO()
+        downloader = MediaIoBaseDownload(output, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return output.getvalue()
+
+    def _read_meta_json(self, subject_folder_id: str) -> dict[str, object]:
+        meta_file = self._find_file(subject_folder_id, "meta.json")
+        if meta_file is None:
+            return {}
+        try:
+            payload = self._download_file(str(meta_file["id"])).decode("utf-8")
+            parsed = json.loads(payload)
+            if isinstance(parsed, dict):
+                return parsed
+            return {}
+        except Exception:
+            return {}
+
+    def _list_files_in_subfolder(self, subject_folder_id: str, subfolder_name: str) -> list[str]:
+        subfolder = self._find_folder(subject_folder_id, subfolder_name)
+        if subfolder is None:
+            return []
+        subfolder_id = str(subfolder["id"])
+        query = (
+            f"'{self._escape_query(subfolder_id)}' in parents and trashed = false "
+            f"and mimeType != '{FOLDER_MIME}'"
+        )
+        items = self._list_files(query, fields="files(name)")
+        names = [str(item.get("name") or "") for item in items if str(item.get("name") or "")]
+        names.sort()
+        return names
