@@ -1,3 +1,10 @@
+databases:
+  - name: recording-ai-auth-db
+    plan: free
+    region: singapore
+    databaseName: recording_ai_auth
+    user: recording_ai_auth_user
+
 services:
   - type: web
     name: recording-ai-backend
@@ -16,6 +23,10 @@ services:
         value: "jobs/jobs.json"
       - key: JOB_STORE_MAX_ITEMS
         value: "1000"
+      - key: AUTH_DATABASE_URL
+        fromDatabase:
+          name: recording-ai-auth-db
+          property: connectionString
       - key: AUTH_PUBLIC_BASE_URL
         value: "https://recording-ai-backend.onrender.com"
       - key: AUTH_MOBILE_REDIRECT_URI

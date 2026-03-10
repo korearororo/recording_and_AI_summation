@@ -32,12 +32,14 @@ Open PowerShell as Administrator, then run:
 .\setup-24x7-server.ps1 `
   -Domain "api.your-domain.com" `
   -OpenAIApiKey "sk-..." `
+  -AuthDatabaseUrl "postgresql://user:pass@host:5432/dbname?sslmode=require" `
   -InstallFfmpeg
 ```
 
 Notes:
 - `-InstallFfmpeg` is recommended for long audio chunking support.
 - Caddy is installed via winget if missing (unless `-SkipCaddyInstall` is used).
+- `-AuthDatabaseUrl` is optional. If set, login data is stored in persistent PostgreSQL.
 
 ## 2) Verify
 

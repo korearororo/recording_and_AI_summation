@@ -8,6 +8,7 @@ param(
     [string]$BackendHost = "127.0.0.1",
     [int]$BackendPort = 8000,
     [string]$AllowedOrigins = "*",
+    [string]$AuthDatabaseUrl = "",
     [string]$AuthMobileRedirectUri = "meetingnoteai://auth/callback",
     [string]$GoogleClientId = "",
     [string]$GoogleClientSecret = "",
@@ -101,6 +102,7 @@ $publicBaseUrl = "https://$Domain"
 $envLines = @(
     "OPENAI_API_KEY=$OpenAIApiKey"
     "ALLOWED_ORIGINS=$AllowedOrigins"
+    "AUTH_DATABASE_URL=$AuthDatabaseUrl"
     "AUTH_PUBLIC_BASE_URL=$publicBaseUrl"
     "AUTH_MOBILE_REDIRECT_URI=$AuthMobileRedirectUri"
     "GOOGLE_CLIENT_ID=$GoogleClientId"

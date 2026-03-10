@@ -18,6 +18,7 @@ If you want to use the app from any network (not only your home/PC LAN), deploy 
 2. Set environment variables on the cloud service:
    - `OPENAI_API_KEY=<your key>`
    - `ALLOWED_ORIGINS=*` (or your exact app origin list)
+   - `AUTH_DATABASE_URL=<postgres connection string>` (recommended for persistent login DB)
    - `AUTH_PUBLIC_BASE_URL=https://<your-backend-domain>`
    - `AUTH_MOBILE_REDIRECT_URI=meetingnoteai://auth/callback`
    - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
@@ -48,6 +49,25 @@ cd backend\deploy\windows
 - `POST /api/process` : audio file -> transcript + summary
 - `GET /api/auth/oauth/{provider}/start` : social login start redirect (`provider`: `google|kakao|naver`)
 - `GET /api/auth/oauth/{provider}/callback` : social login callback -> app deep link redirect
+
+## Storage Paths
+- Auth DB:
+  - If `AUTH_DATABASE_URL` is set: PostgreSQL (persistent)
+  - Otherwise: local SQLite `backend/auth/auth.db` (can be ephemeral on free cloud instances)
+- Uploaded library files:
+  - `LIBRARY_ROOT` (default `backend/library`)
+  - Per-user folder: `library/user_<user_id>/`
+  - Per-subject folder: `<subject_name>__<subject_id>/recordings|transcripts|translations|summaries`
+
+## Optional: Migrate Existing SQLite Auth Data to PostgreSQL
+If users already signed up on SQLite and you want to keep those accounts:
+
+```bash
+cd backend
+python scripts/migrate_auth_sqlite_to_postgres.py \
+  --sqlite-path ./auth/auth.db \
+  --postgres-url "postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=require"
+```
 
 ## Long Lecture Transcription
 - Files larger than `TRANSCRIBE_MAX_FILE_MB` are automatically split and transcribed chunk-by-chunk.

@@ -36,6 +36,7 @@ from app.schemas import (
     TranscriptionResponse,
 )
 from app.services.auth_store import AuthStore
+from app.services.auth_store_postgres import AuthStorePostgres
 from app.services.openai_service import OpenAIService
 
 app = FastAPI(title="Recording & AI Summary API", version="0.1.0")
@@ -45,7 +46,7 @@ JOB_LOCK = Lock()
 JOBS: dict[str, dict[str, object]] = {}
 JOB_STORE_BOOTSTRAPPED = False
 AUTH_LOCK = Lock()
-AUTH_STORE: AuthStore | None = None
+AUTH_STORE: AuthStore | AuthStorePostgres | None = None
 SUPPORTED_OAUTH_PROVIDERS = {"google", "kakao", "naver"}
 
 
@@ -186,15 +187,22 @@ def _bootstrap_job_store(settings: Settings) -> None:
     _load_jobs(settings)
 
 
-def _get_auth_store(settings: Settings) -> AuthStore:
+def _get_auth_store(settings: Settings) -> AuthStore | AuthStorePostgres:
     global AUTH_STORE
     if AUTH_STORE is None:
         with AUTH_LOCK:
             if AUTH_STORE is None:
-                AUTH_STORE = AuthStore(
-                    db_path=_resolve_auth_db_path(settings),
-                    session_ttl_hours=settings.auth_session_hours,
-                )
+                database_url = settings.auth_database_url.strip()
+                if database_url:
+                    AUTH_STORE = AuthStorePostgres(
+                        database_url=database_url,
+                        session_ttl_hours=settings.auth_session_hours,
+                    )
+                else:
+                    AUTH_STORE = AuthStore(
+                        db_path=_resolve_auth_db_path(settings),
+                        session_ttl_hours=settings.auth_session_hours,
+                    )
     return AUTH_STORE
 
 
