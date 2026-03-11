@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -160,9 +162,13 @@ class GoogleDriveLibraryStore:
                     "translation": len(translations) > 0,
                     "summary": len(summaries) > 0,
                     "recordings": recordings,
+                    "recordings_meta": grouped["recordings_meta"],
                     "transcripts": transcripts,
+                    "transcripts_meta": grouped["transcripts_meta"],
                     "translations": translations,
+                    "translations_meta": grouped["translations_meta"],
                     "summaries": summaries,
+                    "summaries_meta": grouped["summaries_meta"],
                 }
             )
 
@@ -340,13 +346,28 @@ class GoogleDriveLibraryStore:
                 return found
         return None
 
-    def _collect_subject_files(self, subject_folder_id: str) -> dict[str, list[str]]:
-        grouped: dict[str, set[str]] = {
+    def _collect_subject_files(self, subject_folder_id: str) -> dict[str, object]:
+        grouped_names: dict[str, set[str]] = {
             "recordings": set(),
             "transcripts": set(),
             "translations": set(),
             "summaries": set(),
         }
+        grouped_meta: dict[str, dict[str, dict[str, object]]] = {
+            "recordings": {},
+            "transcripts": {},
+            "translations": {},
+            "summaries": {},
+        }
+
+        def upsert(kind_group: str, file_name: str, file_item: dict[str, object]) -> None:
+            if not file_name:
+                return
+            grouped_names[kind_group].add(file_name)
+            candidate = self._to_file_meta(file_name, file_item)
+            current = grouped_meta[kind_group].get(file_name)
+            if current is None or float(candidate.get("updated_at") or 0.0) >= float(current.get("updated_at") or 0.0):
+                grouped_meta[kind_group][file_name] = candidate
 
         for entry_folder in self._list_child_folders(subject_folder_id):
             entry_name = str(entry_folder.get("name") or "")
@@ -357,7 +378,7 @@ class GoogleDriveLibraryStore:
                     f"'{self._escape_query(str(entry_folder['id']))}' in parents and trashed = false "
                     f"and mimeType != '{FOLDER_MIME}'"
                 ),
-                fields="files(name)",
+                fields="files(name,md5Checksum,size,modifiedTime)",
             )
             for file_item in files:
                 raw_name = str(file_item.get("name") or "")
@@ -367,25 +388,33 @@ class GoogleDriveLibraryStore:
                 if not original:
                     continue
                 if kind == "recording":
-                    grouped["recordings"].add(original)
+                    upsert("recordings", original, file_item)
                 elif kind == "transcript":
-                    grouped["transcripts"].add(original)
+                    upsert("transcripts", original, file_item)
                 elif kind == "translation":
-                    grouped["translations"].add(original)
+                    upsert("translations", original, file_item)
                 elif kind == "summary":
-                    grouped["summaries"].add(original)
+                    upsert("summaries", original, file_item)
 
         # Backward compatibility for old flat-kind structure.
-        grouped["recordings"].update(self._list_files_in_subfolder(subject_folder_id, "recordings"))
-        grouped["transcripts"].update(self._list_files_in_subfolder(subject_folder_id, "transcripts"))
-        grouped["translations"].update(self._list_files_in_subfolder(subject_folder_id, "translations"))
-        grouped["summaries"].update(self._list_files_in_subfolder(subject_folder_id, "summaries"))
+        for item in self._list_file_meta_in_subfolder(subject_folder_id, "recordings"):
+            upsert("recordings", str(item.get("name") or ""), item)
+        for item in self._list_file_meta_in_subfolder(subject_folder_id, "transcripts"):
+            upsert("transcripts", str(item.get("name") or ""), item)
+        for item in self._list_file_meta_in_subfolder(subject_folder_id, "translations"):
+            upsert("translations", str(item.get("name") or ""), item)
+        for item in self._list_file_meta_in_subfolder(subject_folder_id, "summaries"):
+            upsert("summaries", str(item.get("name") or ""), item)
 
         return {
-            "recordings": sorted(grouped["recordings"]),
-            "transcripts": sorted(grouped["transcripts"]),
-            "translations": sorted(grouped["translations"]),
-            "summaries": sorted(grouped["summaries"]),
+            "recordings": sorted(grouped_names["recordings"]),
+            "recordings_meta": [grouped_meta["recordings"][name] for name in sorted(grouped_meta["recordings"])],
+            "transcripts": sorted(grouped_names["transcripts"]),
+            "transcripts_meta": [grouped_meta["transcripts"][name] for name in sorted(grouped_meta["transcripts"])],
+            "translations": sorted(grouped_names["translations"]),
+            "translations_meta": [grouped_meta["translations"][name] for name in sorted(grouped_meta["translations"])],
+            "summaries": sorted(grouped_names["summaries"]),
+            "summaries_meta": [grouped_meta["summaries"][name] for name in sorted(grouped_meta["summaries"])],
         }
 
     def _find_file(self, parent_id: str, file_name: str) -> dict[str, object] | None:
@@ -395,11 +424,14 @@ class GoogleDriveLibraryStore:
             f"'{escaped_parent}' in parents and trashed = false and mimeType != '{FOLDER_MIME}' "
             f"and name = '{escaped_name}'"
         )
-        items = self._list_files(query, fields="files(id,name,mimeType)")
+        items = self._list_files(query, fields="files(id,name,mimeType,md5Checksum,size,modifiedTime)")
         return items[0] if items else None
 
     def _upload_or_replace_file(self, parent_id: str, file_name: str, content: bytes, content_type: str) -> str:
         existing = self._find_file(parent_id, file_name)
+        content_md5 = hashlib.md5(content).hexdigest()
+        if existing is not None and str(existing.get("md5Checksum") or "").lower() == content_md5.lower():
+            return str(existing["id"])
         media = MediaIoBaseUpload(io.BytesIO(content), mimetype=content_type or "application/octet-stream", resumable=False)
         if existing is not None:
             updated = (
@@ -444,7 +476,7 @@ class GoogleDriveLibraryStore:
         except Exception:
             return {}
 
-    def _list_files_in_subfolder(self, subject_folder_id: str, subfolder_name: str) -> list[str]:
+    def _list_file_meta_in_subfolder(self, subject_folder_id: str, subfolder_name: str) -> list[dict[str, object]]:
         subfolder = self._find_folder(subject_folder_id, subfolder_name)
         if subfolder is None:
             return []
@@ -453,7 +485,41 @@ class GoogleDriveLibraryStore:
             f"'{self._escape_query(subfolder_id)}' in parents and trashed = false "
             f"and mimeType != '{FOLDER_MIME}'"
         )
-        items = self._list_files(query, fields="files(name)")
-        names = [str(item.get("name") or "") for item in items if str(item.get("name") or "")]
-        names.sort()
-        return names
+        items = self._list_files(query, fields="files(name,md5Checksum,size,modifiedTime)")
+        normalized: list[dict[str, object]] = []
+        for item in items:
+            name = str(item.get("name") or "")
+            if not name:
+                continue
+            normalized.append(
+                {
+                    "name": name,
+                    "md5Checksum": str(item.get("md5Checksum") or ""),
+                    "size": item.get("size"),
+                    "modifiedTime": item.get("modifiedTime"),
+                }
+            )
+        normalized.sort(key=lambda entry: str(entry.get("name") or ""))
+        return normalized
+
+    def _to_file_meta(self, file_name: str, file_item: dict[str, object]) -> dict[str, object]:
+        size_raw = file_item.get("size")
+        try:
+            size = int(size_raw) if size_raw is not None else 0
+        except Exception:
+            size = 0
+
+        updated_at = 0.0
+        modified_raw = str(file_item.get("modifiedTime") or "").strip()
+        if modified_raw:
+            try:
+                updated_at = datetime.fromisoformat(modified_raw.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                updated_at = 0.0
+
+        return {
+            "name": file_name,
+            "md5": str(file_item.get("md5Checksum") or ""),
+            "size": size,
+            "updated_at": updated_at,
+        }

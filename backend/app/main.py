@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import shutil
@@ -380,13 +381,26 @@ def _subject_data_dir(target_dir: Path, kind: str) -> Path:
     return data_dir
 
 
-def _collect_subject_files(target_dir: Path) -> dict[str, list[str]]:
-    grouped: dict[str, set[str]] = {
-        "recording": set(),
-        "transcript": set(),
-        "translation": set(),
-        "summary": set(),
+def _collect_subject_files(target_dir: Path) -> dict[str, object]:
+    grouped: dict[str, dict[str, Path]] = {
+        "recording": {},
+        "transcript": {},
+        "translation": {},
+        "summary": {},
     }
+
+    def upsert(kind: str, name: str, path: Path) -> None:
+        if not name:
+            return
+        current = grouped[kind].get(name)
+        if current is None:
+            grouped[kind][name] = path
+            return
+        try:
+            if path.stat().st_mtime >= current.stat().st_mtime:
+                grouped[kind][name] = path
+        except Exception:
+            grouped[kind][name] = path
 
     entries_dir = target_dir / "entries"
     if entries_dir.exists():
@@ -400,7 +414,7 @@ def _collect_subject_files(target_dir: Path) -> dict[str, list[str]]:
                 if parsed is None:
                     continue
                 kind, original_name = parsed
-                grouped[kind].add(original_name)
+                upsert(kind, original_name, child)
 
     # Backward compatibility for old flat-kind structure.
     old_dirs = {
@@ -413,14 +427,48 @@ def _collect_subject_files(target_dir: Path) -> dict[str, list[str]]:
         if old_dir.exists():
             for child in old_dir.iterdir():
                 if child.is_file():
-                    grouped[kind].add(child.name)
+                    upsert(kind, child.name, child)
+
+    def build_meta_list(kind: str) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for name in sorted(grouped[kind]):
+            path = grouped[kind][name]
+            rows.append(_file_meta_row(name, path))
+        return rows
 
     return {
         "recordings": sorted(grouped["recording"]),
+        "recordings_meta": build_meta_list("recording"),
         "transcripts": sorted(grouped["transcript"]),
+        "transcripts_meta": build_meta_list("transcript"),
         "translations": sorted(grouped["translation"]),
+        "translations_meta": build_meta_list("translation"),
         "summaries": sorted(grouped["summary"]),
+        "summaries_meta": build_meta_list("summary"),
     }
+
+
+def _file_md5(path: Path) -> str:
+    digest = hashlib.md5()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_meta_row(name: str, path: Path) -> dict[str, object]:
+    try:
+        stat = path.stat()
+        size = int(stat.st_size)
+        updated_at = float(stat.st_mtime)
+        md5 = _file_md5(path)
+    except Exception:
+        size = 0
+        updated_at = 0.0
+        md5 = ""
+    return {"name": name, "md5": md5, "size": size, "updated_at": updated_at}
 
 
 def _resolve_library_file(settings: Settings, user_id: str, subject_id: str, kind: str, name: str) -> Path:
@@ -1415,9 +1463,13 @@ def list_library(
                 "translation": len(translations) > 0,
                 "summary": len(summaries) > 0,
                 "recordings": recordings,
+                "recordings_meta": files.get("recordings_meta", []),
                 "transcripts": transcripts,
+                "transcripts_meta": files.get("transcripts_meta", []),
                 "translations": translations,
+                "translations_meta": files.get("translations_meta", []),
                 "summaries": summaries,
+                "summaries_meta": files.get("summaries_meta", []),
             }
         )
 

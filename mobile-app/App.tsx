@@ -107,15 +107,46 @@ type AuthUserProfile = {
 
 type SocialProvider = 'kakao' | 'google' | 'naver';
 
+type CloudFileMeta = {
+  name: string;
+  md5: string;
+  size: number;
+  updatedAt: number;
+};
+
+type CloudSubjectSnapshot = {
+  subjectId: string;
+  subjectName: string;
+  subjectTag: string;
+  subjectIcon: string;
+  subjectColor: string;
+  subjectOrder: number | null;
+  recordings: CloudFileMeta[];
+  transcripts: CloudFileMeta[];
+  translations: CloudFileMeta[];
+  summaries: CloudFileMeta[];
+};
+
+type LocalMd5CacheEntry = {
+  size: number;
+  mtime: number;
+  md5: string;
+};
+
+type LocalMd5Cache = Record<string, LocalMd5CacheEntry>;
+
 const PROD_API_URL = 'https://recording-ai-backend.onrender.com';
 const FALLBACK_API_URL = PROD_API_URL;
 const PENDING_JOBS_FILE = new File(Paths.document, 'pending-jobs.json');
 const AUTH_SESSION_FILE = new File(Paths.document, 'auth-session.json');
 const TEMP_RECORDINGS_ROOT = new Directory(Paths.cache, 'temp-recordings');
+const CLOUD_MD5_CACHE_FILE = new File(Paths.document, 'cloud-md5-cache.json');
 const FOLDER_ICON_OPTIONS = ['📁', '📘', '📗', '📕', '🧪', '💻', '📊', '🎵'];
 const FOLDER_COLOR_OPTIONS = ['#DBEAFE', '#E9D5FF', '#FCE7F3', '#DCFCE7', '#FEF3C7', '#E0F2FE', '#F1F5F9'];
 const DEFAULT_FOLDER_ICON = '📁';
 const DEFAULT_FOLDER_COLOR = '#DBEAFE';
+const CLOUD_UPLOAD_CONCURRENCY = 3;
+const CLOUD_RESTORE_CONCURRENCY = 4;
 const SOCIAL_PROVIDER_LABELS: Record<SocialProvider, string> = {
   kakao: '카카오',
   google: '구글',
@@ -206,6 +237,7 @@ export default function App() {
   const [statusMessage, setStatusMessage] = useState('준비 완료');
   const [isBusy, setIsBusy] = useState(false);
   const [recordActionBusy, setRecordActionBusy] = useState(false);
+  const [cloudSyncBusy, setCloudSyncBusy] = useState<'upload' | 'restore' | null>(null);
   const [libraryPath, setLibraryPath] = useState('');
   const [librarySavedFiles, setLibrarySavedFiles] = useState<string[]>([]);
   const [authModalVisible, setAuthModalVisible] = useState(false);
@@ -224,8 +256,9 @@ export default function App() {
       : process.env.EXPO_PUBLIC_API_BASE_URL_IOS) ??
     FALLBACK_API_URL;
   const normalizedApiBaseUrl = normalizeApiBaseUrl(rawApiBaseUrl, FALLBACK_API_URL);
-  const apiBaseUrl =
-    Platform.OS === 'android' && Constants.isDevice && normalizedApiBaseUrl.includes('10.0.2.2')
+  const apiBaseUrl = !__DEV__
+    ? PROD_API_URL
+    : Platform.OS === 'android' && Constants.isDevice && normalizedApiBaseUrl.includes('10.0.2.2')
       ? PROD_API_URL
       : normalizedApiBaseUrl;
 
@@ -1919,8 +1952,25 @@ export default function App() {
     }
     try {
       setIsBusy(true);
+      setCloudSyncBusy('upload');
       setStatusMessage('서버 업로드 시작...');
       ensureSubjectsRoot();
+
+      const cloudListResponse = await fetch(`${apiBaseUrl}/api/library`, {
+        headers: getAuthHeaders(),
+      });
+      const cloudListPayload = await readJsonSafely(cloudListResponse);
+      if (!cloudListResponse.ok) {
+        throw new Error(getApiErrorMessage(cloudListPayload, cloudListResponse, '서버 목록 조회 실패'));
+      }
+
+      const cloudSubjects = normalizeCloudSubjectSnapshots(cloudListPayload?.subjects);
+      const cloudSubjectById: Record<string, CloudSubjectSnapshot> = {};
+      for (const subject of cloudSubjects) {
+        cloudSubjectById[subject.subjectId] = subject;
+      }
+      const cloudMetaLookup = buildCloudMetaLookup(cloudSubjects);
+      const md5Cache = await loadLocalMd5Cache();
 
       const dirs = SUBJECTS_ROOT.list().filter((entry): entry is Directory => entry instanceof Directory);
       if (dirs.length === 0) {
@@ -1929,6 +1979,10 @@ export default function App() {
       }
 
       let uploadUnits = 0;
+      let checkedParts = 0;
+      let uploadedParts = 0;
+      let skippedParts = 0;
+      let syncedMetaCount = 0;
       for (const dir of dirs) {
         const subjectId = dir.name;
         const paths = getSubjectPaths(subjectId);
@@ -1938,92 +1992,129 @@ export default function App() {
         const subjectIcon = meta?.icon ?? DEFAULT_FOLDER_ICON;
         const subjectColor = meta?.color ?? DEFAULT_FOLDER_COLOR;
         const subjectOrder = normalizeSubjectOrder(meta?.order) ?? 999999;
+        const remoteSubject = cloudSubjectById[subjectId];
+        const shouldSyncMeta =
+          !remoteSubject ||
+          remoteSubject.subjectName !== subjectName ||
+          remoteSubject.subjectTag !== subjectTag ||
+          (remoteSubject.subjectIcon || DEFAULT_FOLDER_ICON) !== subjectIcon ||
+          normalizeFolderColor(remoteSubject.subjectColor || DEFAULT_FOLDER_COLOR) !== normalizeFolderColor(subjectColor) ||
+          (remoteSubject.subjectOrder ?? 999999) !== subjectOrder;
 
-        const metaForm = new FormData();
-        metaForm.append('subject_id', subjectId);
-        metaForm.append('subject_name', subjectName);
-        metaForm.append('subject_tag', subjectTag);
-        metaForm.append('subject_icon', subjectIcon);
-        metaForm.append('subject_color', subjectColor);
-        metaForm.append('subject_order', String(subjectOrder));
-        await postLibrarySync(metaForm);
+        if (shouldSyncMeta) {
+          const metaForm = new FormData();
+          metaForm.append('subject_id', subjectId);
+          metaForm.append('subject_name', subjectName);
+          metaForm.append('subject_tag', subjectTag);
+          metaForm.append('subject_icon', subjectIcon);
+          metaForm.append('subject_color', subjectColor);
+          metaForm.append('subject_order', String(subjectOrder));
+          await postLibrarySync(metaForm);
+          syncedMetaCount += 1;
+        }
 
         const items = listRecordingItems(paths);
+        const uploadTasks: Array<() => Promise<void>> = [];
         for (const item of items) {
           const recordingName = item.recordingFile.name || item.title;
-          const unitForm = new FormData();
-          unitForm.append('subject_id', subjectId);
-          unitForm.append('subject_name', subjectName);
-          unitForm.append('subject_tag', subjectTag);
-          unitForm.append('subject_icon', subjectIcon);
-          unitForm.append('subject_color', subjectColor);
-          unitForm.append('subject_order', String(subjectOrder));
-
-          let hasAny = false;
-          if (item.recordingFile.exists) {
-            unitForm.append('recording_name', recordingName);
-            unitForm.append(
-              'recording',
-              {
-                uri: item.recordingFile.uri,
-                name: recordingName,
-                type: recordingMimeType(recordingName),
-              } as any,
-            );
-            hasAny = true;
-          }
-          if (item.transcriptFile.exists) {
-            const transcriptName = item.transcriptFile.name || `${stripAudioExtension(recordingName)}.txt`;
-            unitForm.append('transcript_name', transcriptName);
-            unitForm.append(
-              'transcript',
-              {
-                uri: item.transcriptFile.uri,
-                name: transcriptName,
-                type: 'text/plain',
-              } as any,
-            );
-            hasAny = true;
-          }
-          if (item.translationFile.exists) {
-            const translationName = item.translationFile.name || `${stripAudioExtension(recordingName)}.txt`;
-            unitForm.append('translation_name', translationName);
-            unitForm.append(
-              'translation',
-              {
-                uri: item.translationFile.uri,
-                name: translationName,
-                type: 'text/plain',
-              } as any,
-            );
-            hasAny = true;
-          }
-          if (item.summaryFile.exists) {
-            const summaryName = item.summaryFile.name || `${stripAudioExtension(recordingName)}.txt`;
-            unitForm.append('summary_name', summaryName);
-            unitForm.append(
-              'summary',
-              {
-                uri: item.summaryFile.uri,
-                name: summaryName,
-                type: 'text/plain',
-              } as any,
-            );
-            hasAny = true;
-          }
-
+          const hasAny =
+            item.recordingFile.exists ||
+            item.transcriptFile.exists ||
+            item.translationFile.exists ||
+            item.summaryFile.exists;
           if (!hasAny) {
             continue;
           }
-          await postLibrarySync(unitForm);
-          uploadUnits += 1;
+
+          const uploadParts: Array<{
+            kind: 'recording' | 'transcript' | 'translation' | 'summary';
+            name: string;
+            file: File;
+            mimeType: string;
+            md5: string;
+          }> = [];
+
+          const queueIfChanged = (
+            kind: 'recording' | 'transcript' | 'translation' | 'summary',
+            name: string,
+            file: File,
+            mimeType: string,
+          ) => {
+            checkedParts += 1;
+            const remote = cloudMetaLookup[cloudLookupKey(subjectId, kind, name)];
+            const localMd5 = getFileMd5Cached(file, md5Cache);
+            if (remote?.md5 && localMd5 && remote.md5 === localMd5) {
+              skippedParts += 1;
+              return;
+            }
+            uploadParts.push({ kind, name, file, mimeType, md5: localMd5 });
+          };
+
+          if (item.recordingFile.exists) {
+            queueIfChanged('recording', recordingName, item.recordingFile, recordingMimeType(recordingName));
+          }
+          if (item.transcriptFile.exists) {
+            const transcriptName = item.transcriptFile.name || `${stripAudioExtension(recordingName)}.txt`;
+            queueIfChanged('transcript', transcriptName, item.transcriptFile, 'text/plain');
+          }
+          if (item.translationFile.exists) {
+            const translationName = item.translationFile.name || `${stripAudioExtension(recordingName)}.txt`;
+            queueIfChanged('translation', translationName, item.translationFile, 'text/plain');
+          }
+          if (item.summaryFile.exists) {
+            const summaryName = item.summaryFile.name || `${stripAudioExtension(recordingName)}.txt`;
+            queueIfChanged('summary', summaryName, item.summaryFile, 'text/plain');
+          }
+
+          if (uploadParts.length === 0) {
+            continue;
+          }
+
+          uploadTasks.push(async () => {
+            const unitForm = new FormData();
+            unitForm.append('subject_id', subjectId);
+            unitForm.append('subject_name', subjectName);
+            unitForm.append('subject_tag', subjectTag);
+            unitForm.append('subject_icon', subjectIcon);
+            unitForm.append('subject_color', subjectColor);
+            unitForm.append('subject_order', String(subjectOrder));
+
+            for (const part of uploadParts) {
+              unitForm.append(`${part.kind}_name`, part.name);
+              if (part.md5) {
+                unitForm.append(`${part.kind}_md5`, part.md5);
+              }
+              unitForm.append(
+                part.kind,
+                {
+                  uri: part.file.uri,
+                  name: part.name,
+                  type: part.mimeType,
+                } as any,
+              );
+            }
+
+            await postLibrarySync(unitForm);
+            uploadUnits += 1;
+            uploadedParts += uploadParts.length;
+          });
+        }
+
+        if (uploadTasks.length > 0) {
+          await runTasksWithConcurrency(uploadTasks, CLOUD_UPLOAD_CONCURRENCY, (done, total) => {
+            setStatusMessage(`서버 업로드 중... (${subjectName} ${done}/${total})`);
+          });
         }
       }
+      await saveLocalMd5Cache(md5Cache);
 
-      setStatusMessage(`서버 업로드 완료 (파일 세트 ${uploadUnits}개)`);
+      setStatusMessage(
+        `서버 업로드 완료 (세트 ${uploadUnits}개, 파일 ${uploadedParts}/${checkedParts}개, 스킵 ${skippedParts}개, 메타 ${syncedMetaCount}개)`,
+      );
     } catch (error) {
       setStatusMessage(`서버 업로드 실패: ${formatError(error)}`);
     } finally {
+      setCloudSyncBusy(null);
       setIsBusy(false);
     }
   };
@@ -2037,6 +2128,7 @@ export default function App() {
     }
     try {
       setIsBusy(true);
+      setCloudSyncBusy('restore');
       setStatusMessage('서버 복원 시작...');
 
       const response = await fetch(`${apiBaseUrl}/api/library`, {
@@ -2047,24 +2139,25 @@ export default function App() {
         throw new Error(getApiErrorMessage(payload, response, '서버 목록 조회 실패'));
       }
 
-      const cloudSubjects = Array.isArray(payload?.subjects)
-        ? payload.subjects.filter((item: unknown) => typeof item === 'object' && item !== null)
-        : [];
+      const cloudSubjects = normalizeCloudSubjectSnapshots(payload?.subjects);
       if (cloudSubjects.length === 0) {
         setStatusMessage('서버에 저장된 폴더가 없습니다.');
         return;
       }
 
       let downloadedFiles = 0;
+      let skippedFiles = 0;
       const failedFiles: string[] = [];
       let firstSubjectId: string | null = null;
       ensureSubjectsRoot();
+      const md5Cache = await loadLocalMd5Cache();
 
       const downloadAndReplace = async (
         subjectId: string,
         kind: 'recording' | 'transcript' | 'translation' | 'summary',
         name: string,
         targetDir: Directory,
+        expectedMd5?: string,
       ): Promise<boolean> => {
         const target = new File(targetDir, name);
         const temp = new File(targetDir, `.__tmp__${Date.now()}-${Math.random().toString(36).slice(2)}-${name}`);
@@ -2085,6 +2178,11 @@ export default function App() {
             }
             temp.copy(target);
             temp.delete();
+            if (expectedMd5) {
+              updateFileMd5Cache(target, expectedMd5, md5Cache);
+            } else {
+              getFileMd5Cached(target, md5Cache);
+            }
             return true;
           } catch (error) {
             lastError = error;
@@ -2102,8 +2200,8 @@ export default function App() {
       };
 
       for (let index = 0; index < cloudSubjects.length; index += 1) {
-        const entry = cloudSubjects[index] as any;
-        const subjectId = String(entry.subject_id ?? '').trim();
+        const entry = cloudSubjects[index];
+        const subjectId = entry.subjectId.trim();
         if (!subjectId) {
           continue;
         }
@@ -2111,11 +2209,11 @@ export default function App() {
           firstSubjectId = subjectId;
         }
 
-        const subjectName = String(entry.subject_name ?? subjectId);
-        const subjectTag = normalizeSubjectTag(String(entry.subject_tag ?? 'major'));
-        const subjectIcon = String(entry.subject_icon ?? DEFAULT_FOLDER_ICON) || DEFAULT_FOLDER_ICON;
-        const subjectColor = normalizeFolderColor(String(entry.subject_color ?? DEFAULT_FOLDER_COLOR));
-        const subjectOrder = normalizeSubjectOrder(entry.subject_order) ?? index + 1;
+        const subjectName = entry.subjectName || subjectId;
+        const subjectTag = normalizeSubjectTag(entry.subjectTag || 'major');
+        const subjectIcon = entry.subjectIcon || DEFAULT_FOLDER_ICON;
+        const subjectColor = normalizeFolderColor(entry.subjectColor || DEFAULT_FOLDER_COLOR);
+        const subjectOrder = entry.subjectOrder ?? index + 1;
 
         const paths = getSubjectPaths(subjectId);
         paths.dir.create({ idempotent: true, intermediates: true });
@@ -2131,46 +2229,60 @@ export default function App() {
         };
         writeText(paths.meta, JSON.stringify(meta, null, 2));
 
-        const recordings = Array.isArray(entry.recordings)
-          ? entry.recordings.filter((value: unknown): value is string => typeof value === 'string')
-          : [];
-        const transcripts = Array.isArray(entry.transcripts)
-          ? entry.transcripts.filter((value: unknown): value is string => typeof value === 'string')
-          : [];
-        const translations = Array.isArray(entry.translations)
-          ? entry.translations.filter((value: unknown): value is string => typeof value === 'string')
-          : [];
-        const summaries = Array.isArray(entry.summaries)
-          ? entry.summaries.filter((value: unknown): value is string => typeof value === 'string')
-          : [];
-
         setStatusMessage(`서버 복원 중... (${index + 1}/${cloudSubjects.length}) ${subjectName}`);
 
-        for (const name of recordings) {
-          const ok = await downloadAndReplace(subjectId, 'recording', name, paths.recordingsDir);
-          if (ok) {
-            downloadedFiles += 1;
+        const restoreTasks: Array<() => Promise<boolean>> = [];
+        const pushRestoreIfNeeded = (
+          kind: 'recording' | 'transcript' | 'translation' | 'summary',
+          fileMeta: CloudFileMeta,
+          targetDir: Directory,
+        ) => {
+          const name = fileMeta.name;
+          if (!name) {
+            return;
           }
+          const target = new File(targetDir, name);
+          if (target.exists) {
+            const remoteMd5 = fileMeta.md5.trim().toLowerCase();
+            if (remoteMd5) {
+              const localMd5 = getFileMd5Cached(target, md5Cache);
+              if (localMd5 && localMd5 === remoteMd5) {
+                skippedFiles += 1;
+                return;
+              }
+            } else if (fileMeta.size > 0) {
+              const localSize = getLocalFileSignature(target).size;
+              if (localSize === fileMeta.size) {
+                skippedFiles += 1;
+                return;
+              }
+            }
+          }
+          restoreTasks.push(() => downloadAndReplace(subjectId, kind, name, targetDir, fileMeta.md5));
+        };
+
+        for (const fileMeta of entry.recordings) {
+          pushRestoreIfNeeded('recording', fileMeta, paths.recordingsDir);
         }
-        for (const name of transcripts) {
-          const ok = await downloadAndReplace(subjectId, 'transcript', name, paths.transcriptsDir);
-          if (ok) {
-            downloadedFiles += 1;
-          }
+        for (const fileMeta of entry.transcripts) {
+          pushRestoreIfNeeded('transcript', fileMeta, paths.transcriptsDir);
         }
-        for (const name of translations) {
-          const ok = await downloadAndReplace(subjectId, 'translation', name, paths.translationsDir);
-          if (ok) {
-            downloadedFiles += 1;
-          }
+        for (const fileMeta of entry.translations) {
+          pushRestoreIfNeeded('translation', fileMeta, paths.translationsDir);
         }
-        for (const name of summaries) {
-          const ok = await downloadAndReplace(subjectId, 'summary', name, paths.summariesDir);
-          if (ok) {
-            downloadedFiles += 1;
-          }
+        for (const fileMeta of entry.summaries) {
+          pushRestoreIfNeeded('summary', fileMeta, paths.summariesDir);
+        }
+
+        if (restoreTasks.length > 0) {
+          const results = await runTasksWithConcurrency(restoreTasks, CLOUD_RESTORE_CONCURRENCY, (done, total) => {
+            setStatusMessage(`서버 복원 중... (${index + 1}/${cloudSubjects.length}) ${subjectName} ${done}/${total}`);
+          });
+          downloadedFiles += results.filter(Boolean).length;
         }
       }
+
+      await saveLocalMd5Cache(md5Cache);
 
       await loadSubjects(firstSubjectId ?? undefined);
       if (firstSubjectId) {
@@ -2178,13 +2290,14 @@ export default function App() {
       }
       setScreenMode('home');
       if (failedFiles.length > 0) {
-        setStatusMessage(`서버 복원 완료 (성공 ${downloadedFiles}개, 실패 ${failedFiles.length}개)`);
+        setStatusMessage(`서버 복원 완료 (다운로드 ${downloadedFiles}개, 스킵 ${skippedFiles}개, 실패 ${failedFiles.length}개)`);
       } else {
-        setStatusMessage(`서버 복원 완료 (파일 ${downloadedFiles}개)`);
+        setStatusMessage(`서버 복원 완료 (다운로드 ${downloadedFiles}개, 스킵 ${skippedFiles}개)`);
       }
     } catch (error) {
       setStatusMessage(`서버 복원 실패: ${formatError(error)}`);
     } finally {
+      setCloudSyncBusy(null);
       setIsBusy(false);
     }
   };
@@ -2393,14 +2506,28 @@ export default function App() {
                   onPress={uploadAllFoldersToCloud}
                   disabled={isBusy}
                 >
-                  <Text style={styles.cloudSyncButtonText}>서버 업로드</Text>
+                  <View style={styles.cloudSyncContent}>
+                    <Text style={styles.cloudSyncButtonText}>
+                      {cloudSyncBusy === 'upload' ? '서버 업로드 중...' : '서버 업로드'}
+                    </Text>
+                    {cloudSyncBusy === 'upload' ? (
+                      <ActivityIndicator size="small" color="#1E3A8A" style={styles.cloudSyncSpinner} />
+                    ) : null}
+                  </View>
                 </Pressable>
                 <Pressable
                   style={[styles.cloudSyncButton, isBusy && styles.disabledButton]}
                   onPress={restoreAllFoldersFromCloud}
                   disabled={isBusy}
                 >
-                  <Text style={styles.cloudSyncButtonText}>서버에서 복원</Text>
+                  <View style={styles.cloudSyncContent}>
+                    <Text style={styles.cloudSyncButtonText}>
+                      {cloudSyncBusy === 'restore' ? '복원 중...' : '서버에서 복원'}
+                    </Text>
+                    {cloudSyncBusy === 'restore' ? (
+                      <ActivityIndicator size="small" color="#1E3A8A" style={styles.cloudSyncSpinner} />
+                    ) : null}
+                  </View>
                 </Pressable>
               </View>
               <Pressable
@@ -3382,6 +3509,246 @@ function recordingMimeType(fileName: string): string {
   return 'audio/m4a';
 }
 
+async function runTasksWithConcurrency<T>(
+  tasks: Array<() => Promise<T>>,
+  concurrency: number,
+  onProgress?: (done: number, total: number) => void,
+): Promise<T[]> {
+  if (tasks.length === 0) {
+    return [];
+  }
+
+  const workerCount = Math.max(1, Math.min(concurrency, tasks.length));
+  const results: T[] = new Array(tasks.length);
+  let nextIndex = 0;
+  let done = 0;
+
+  const worker = async () => {
+    while (true) {
+      const current = nextIndex;
+      nextIndex += 1;
+      if (current >= tasks.length) {
+        return;
+      }
+
+      results[current] = await tasks[current]();
+      done += 1;
+      onProgress?.(done, tasks.length);
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
+function cloudLookupKey(
+  subjectId: string,
+  kind: 'recording' | 'transcript' | 'translation' | 'summary',
+  name: string,
+): string {
+  return `${subjectId}::${kind}::${name}`;
+}
+
+function toCloudFileMetaArray(rawMeta: unknown, fallbackNames: string[]): CloudFileMeta[] {
+  const map = new Map<string, CloudFileMeta>();
+
+  if (Array.isArray(rawMeta)) {
+    for (const row of rawMeta) {
+      if (!row || typeof row !== 'object') {
+        continue;
+      }
+      const value = row as any;
+      const name = typeof value.name === 'string' ? value.name.trim() : '';
+      if (!name) {
+        continue;
+      }
+      const md5 = typeof value.md5 === 'string' ? value.md5.trim().toLowerCase() : '';
+      const sizeRaw = Number(value.size ?? 0);
+      const updatedRaw = Number(value.updated_at ?? value.updatedAt ?? 0);
+      map.set(name, {
+        name,
+        md5,
+        size: Number.isFinite(sizeRaw) && sizeRaw > 0 ? Math.floor(sizeRaw) : 0,
+        updatedAt: Number.isFinite(updatedRaw) && updatedRaw > 0 ? updatedRaw : 0,
+      });
+    }
+  }
+
+  for (const fallback of fallbackNames) {
+    if (typeof fallback !== 'string') {
+      continue;
+    }
+    const name = fallback.trim();
+    if (!name || map.has(name)) {
+      continue;
+    }
+    map.set(name, { name, md5: '', size: 0, updatedAt: 0 });
+  }
+
+  return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function normalizeCloudSubjectSnapshots(raw: unknown): CloudSubjectSnapshot[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  const rows: CloudSubjectSnapshot[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+    const value = entry as any;
+    const subjectId = typeof value.subject_id === 'string' ? value.subject_id.trim() : '';
+    if (!subjectId) {
+      continue;
+    }
+    const subjectName = typeof value.subject_name === 'string' && value.subject_name.trim() ? value.subject_name.trim() : subjectId;
+    const subjectTag = typeof value.subject_tag === 'string' ? value.subject_tag : '';
+    const subjectIcon = typeof value.subject_icon === 'string' ? value.subject_icon : '';
+    const subjectColor = typeof value.subject_color === 'string' ? value.subject_color : '';
+    const subjectOrder = normalizeSubjectOrder(value.subject_order);
+
+    const recordings = Array.isArray(value.recordings)
+      ? value.recordings.filter((item: unknown): item is string => typeof item === 'string')
+      : [];
+    const transcripts = Array.isArray(value.transcripts)
+      ? value.transcripts.filter((item: unknown): item is string => typeof item === 'string')
+      : [];
+    const translations = Array.isArray(value.translations)
+      ? value.translations.filter((item: unknown): item is string => typeof item === 'string')
+      : [];
+    const summaries = Array.isArray(value.summaries)
+      ? value.summaries.filter((item: unknown): item is string => typeof item === 'string')
+      : [];
+
+    rows.push({
+      subjectId,
+      subjectName,
+      subjectTag,
+      subjectIcon,
+      subjectColor,
+      subjectOrder,
+      recordings: toCloudFileMetaArray(value.recordings_meta, recordings),
+      transcripts: toCloudFileMetaArray(value.transcripts_meta, transcripts),
+      translations: toCloudFileMetaArray(value.translations_meta, translations),
+      summaries: toCloudFileMetaArray(value.summaries_meta, summaries),
+    });
+  }
+
+  return rows;
+}
+
+function buildCloudMetaLookup(subjects: CloudSubjectSnapshot[]): Record<string, CloudFileMeta> {
+  const lookup: Record<string, CloudFileMeta> = {};
+  for (const subject of subjects) {
+    for (const file of subject.recordings) {
+      lookup[cloudLookupKey(subject.subjectId, 'recording', file.name)] = file;
+    }
+    for (const file of subject.transcripts) {
+      lookup[cloudLookupKey(subject.subjectId, 'transcript', file.name)] = file;
+    }
+    for (const file of subject.translations) {
+      lookup[cloudLookupKey(subject.subjectId, 'translation', file.name)] = file;
+    }
+    for (const file of subject.summaries) {
+      lookup[cloudLookupKey(subject.subjectId, 'summary', file.name)] = file;
+    }
+  }
+  return lookup;
+}
+
+async function loadLocalMd5Cache(): Promise<LocalMd5Cache> {
+  if (!CLOUD_MD5_CACHE_FILE.exists) {
+    return {};
+  }
+  try {
+    const raw = await CLOUD_MD5_CACHE_FILE.text();
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') {
+      return {};
+    }
+    const safe: LocalMd5Cache = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      if (!value || typeof value !== 'object') {
+        continue;
+      }
+      const row = value as any;
+      const md5 = typeof row.md5 === 'string' ? row.md5.trim().toLowerCase() : '';
+      const size = Number(row.size ?? 0);
+      const mtime = Number(row.mtime ?? 0);
+      if (!md5 || !Number.isFinite(size) || !Number.isFinite(mtime)) {
+        continue;
+      }
+      safe[key] = { md5, size: Math.floor(size), mtime };
+    }
+    return safe;
+  } catch {
+    return {};
+  }
+}
+
+async function saveLocalMd5Cache(cache: LocalMd5Cache): Promise<void> {
+  try {
+    const entries = Object.entries(cache);
+    const compact = entries.slice(Math.max(0, entries.length - 6000));
+    const payload = Object.fromEntries(compact);
+    writeText(CLOUD_MD5_CACHE_FILE, JSON.stringify(payload));
+  } catch {
+    // Hash cache write failure should not fail upload/restore.
+  }
+}
+
+function getLocalFileSignature(file: File): { size: number; mtime: number } {
+  try {
+    const info = file.info();
+    const sizeRaw = Number(info.size ?? file.size ?? 0);
+    const mtimeRaw = Number(info.modificationTime ?? file.modificationTime ?? 0);
+    return {
+      size: Number.isFinite(sizeRaw) && sizeRaw > 0 ? Math.floor(sizeRaw) : 0,
+      mtime: Number.isFinite(mtimeRaw) && mtimeRaw > 0 ? mtimeRaw : 0,
+    };
+  } catch {
+    const sizeRaw = Number(file.size ?? 0);
+    const mtimeRaw = Number(file.modificationTime ?? 0);
+    return {
+      size: Number.isFinite(sizeRaw) && sizeRaw > 0 ? Math.floor(sizeRaw) : 0,
+      mtime: Number.isFinite(mtimeRaw) && mtimeRaw > 0 ? mtimeRaw : 0,
+    };
+  }
+}
+
+function getFileMd5Cached(file: File, cache: LocalMd5Cache): string {
+  if (!file.exists) {
+    return '';
+  }
+  const key = file.uri;
+  const signature = getLocalFileSignature(file);
+  const cached = cache[key];
+  if (cached && cached.size === signature.size && cached.mtime === signature.mtime && cached.md5) {
+    return cached.md5;
+  }
+  try {
+    const md5Info = file.info({ md5: true });
+    const md5 = typeof md5Info.md5 === 'string' ? md5Info.md5.trim().toLowerCase() : '';
+    if (md5) {
+      cache[key] = { size: signature.size, mtime: signature.mtime, md5 };
+    }
+    return md5;
+  } catch {
+    return '';
+  }
+}
+
+function updateFileMd5Cache(file: File, md5: string, cache: LocalMd5Cache) {
+  const normalized = (md5 || '').trim().toLowerCase();
+  if (!normalized) {
+    return;
+  }
+  const signature = getLocalFileSignature(file);
+  cache[file.uri] = { size: signature.size, mtime: signature.mtime, md5: normalized };
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -3626,6 +3993,14 @@ const styles = StyleSheet.create({
     color: '#1E3A8A',
     fontSize: 12,
     fontWeight: '800',
+  },
+  cloudSyncContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cloudSyncSpinner: {
+    marginLeft: 8,
   },
   cloudArchiveButton: {
     marginTop: 8,
