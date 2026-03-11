@@ -147,7 +147,7 @@ const FOLDER_COLOR_OPTIONS = ['#DBEAFE', '#E9D5FF', '#FCE7F3', '#DCFCE7', '#FEF3
 const DEFAULT_FOLDER_ICON = '📁';
 const DEFAULT_FOLDER_COLOR = '#DBEAFE';
 const CLOUD_UPLOAD_CONCURRENCY = 3;
-const CLOUD_RESTORE_CONCURRENCY = 4;
+const CLOUD_RESTORE_CONCURRENCY = 2;
 const SOCIAL_PROVIDER_LABELS: Record<SocialProvider, string> = {
   kakao: '카카오',
   google: '구글',
@@ -2174,12 +2174,13 @@ export default function App() {
         const url = `${apiBaseUrl}/api/library/file?${query.join('&')}`;
         let lastError: unknown = null;
 
-        for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const maxAttempts = 5;
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
           try {
             if (temp.exists) {
               temp.delete();
             }
-            await File.downloadFileAsync(url, temp, { headers: getAuthHeaders() });
+            await downloadToFileWithAuth(url, temp, getAuthHeaders());
             if (!temp.exists) {
               throw new Error('다운로드 임시 파일을 찾지 못했습니다.');
             }
@@ -2199,8 +2200,10 @@ export default function App() {
             if (temp.exists) {
               temp.delete();
             }
-            if (attempt < 3) {
-              await delay(1200 * attempt);
+            if (attempt < maxAttempts) {
+              const msg = formatError(error);
+              const transient = /\((502|503|504)\b/.test(msg) || /\b(502|503|504)\b/.test(msg);
+              await delay(transient ? 3000 * attempt : 1200 * attempt);
             }
           }
         }
@@ -2333,7 +2336,7 @@ export default function App() {
       }
       setScreenMode('home');
       if (failedFiles.length > 0) {
-        const firstFailure = failedFiles[0]?.slice(0, 120) ?? '';
+        const firstFailure = failedFiles[0]?.slice(0, 320) ?? '';
         setStatusMessage(
           `서버 복원 완료 (다운로드 ${downloadedFiles}개, 스킵 ${skippedFiles}개, 실패 ${failedFiles.length}개)${firstFailure ? ` / 첫 실패: ${firstFailure}` : ''}`,
         );
@@ -3807,6 +3810,20 @@ function updateFileMd5Cache(file: File, md5: string, cache: LocalMd5Cache) {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function downloadToFileWithAuth(url: string, destination: File, headers: Record<string, string>): Promise<void> {
+  const response = await fetch(url, { headers });
+  if (!response.ok) {
+    const payload = await readJsonSafely(response);
+    throw new Error(getApiErrorMessage(payload, response, '파일 다운로드 실패', url));
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (destination.exists) {
+    destination.delete();
+  }
+  destination.create({ intermediates: true, overwrite: true });
+  destination.write(bytes);
 }
 
 async function readJsonSafely(response: Response): Promise<any> {

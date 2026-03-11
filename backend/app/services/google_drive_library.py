@@ -183,6 +183,43 @@ class GoogleDriveLibraryStore:
         file_name: str,
         file_id: str | None = None,
     ) -> tuple[bytes, str, str]:
+        resolved_file_id, resolved_name, content_type = self.resolve_subject_file(
+            user_id=user_id,
+            subject_id=subject_id,
+            kind=kind,
+            file_name=file_name,
+            file_id=file_id,
+        )
+        content = self._download_file(resolved_file_id)
+        return content, resolved_name, content_type
+
+    def download_subject_file_to_path(
+        self,
+        user_id: str,
+        subject_id: str,
+        kind: str,
+        file_name: str,
+        destination: Path,
+        file_id: str | None = None,
+    ) -> tuple[Path, str, str]:
+        resolved_file_id, resolved_name, content_type = self.resolve_subject_file(
+            user_id=user_id,
+            subject_id=subject_id,
+            kind=kind,
+            file_name=file_name,
+            file_id=file_id,
+        )
+        self._download_file_to_path(resolved_file_id, destination)
+        return destination, resolved_name, content_type
+
+    def resolve_subject_file(
+        self,
+        user_id: str,
+        subject_id: str,
+        kind: str,
+        file_name: str,
+        file_id: str | None = None,
+    ) -> tuple[str, str, str]:
         user_folder = self._find_folder(self._root_folder_id, f"user_{self._safe_segment(user_id)}")
         if user_folder is None:
             raise FileNotFoundError("user folder not found")
@@ -208,9 +245,8 @@ class GoogleDriveLibraryStore:
                 if "__" in direct_name:
                     _, original = direct_name.split("__", 1)
                     direct_name = original or file_name
-                content = self._download_file(requested_file_id)
                 content_type = str(direct_file.get("mimeType") or "application/octet-stream")
-                return content, (file_name or direct_name), content_type
+                return requested_file_id, (file_name or direct_name), content_type
             except Exception:
                 # Fallback to legacy name-based lookup.
                 pass
@@ -231,10 +267,9 @@ class GoogleDriveLibraryStore:
         if target_file is None:
             raise FileNotFoundError("file not found")
 
-        file_id = str(target_file["id"])
-        content = self._download_file(file_id)
+        resolved_file_id = str(target_file["id"])
         content_type = str(target_file.get("mimeType") or "application/octet-stream")
-        return content, file_name, content_type
+        return resolved_file_id, file_name, content_type
 
     def archive_and_clear_user_library(self, user_id: str) -> dict[str, object]:
         user_folder_name = f"user_{self._safe_segment(user_id)}"
@@ -488,6 +523,15 @@ class GoogleDriveLibraryStore:
         while not done:
             _, done = downloader.next_chunk()
         return output.getvalue()
+
+    def _download_file_to_path(self, file_id: str, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        request = self._drive.files().get_media(fileId=file_id, supportsAllDrives=True)
+        with destination.open("wb") as output:
+            downloader = MediaIoBaseDownload(output, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
 
     def _read_meta_json(self, subject_folder_id: str) -> dict[str, object]:
         meta_file = self._find_file(subject_folder_id, "meta.json")

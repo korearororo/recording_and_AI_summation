@@ -18,6 +18,7 @@ from urllib import request as urllib_request
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from app.config import Settings, get_settings
 from app.schemas import (
@@ -1499,14 +1500,25 @@ def download_library_file(
     settings: Settings = Depends(get_settings),
     current_user: dict[str, str] = Depends(_require_user),
 ) -> Response:
+    def _cleanup_temp_file(path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     if _use_google_drive_library(settings):
         drive_store = _get_google_drive_store(settings)
         try:
-            content, filename, content_type = drive_store.download_subject_file(
+            tmp_dir = Path(tempfile.gettempdir()) / "recording-ai-downloads"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            suffix = Path(name).suffix or ".bin"
+            tmp_file = tmp_dir / f"download-{uuid.uuid4().hex}{suffix}"
+            file_path, filename, content_type = drive_store.download_subject_file_to_path(
                 user_id=current_user["id"],
                 subject_id=subject_id,
                 kind=kind,
                 file_name=name,
+                destination=tmp_file,
                 file_id=file_id,
             )
         except ValueError as exc:
@@ -1517,7 +1529,13 @@ def download_library_file(
             raise HTTPException(status_code=500, detail=f"Drive file download failed: {exc}") from exc
 
         headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-        return StreamingResponse(io.BytesIO(content), media_type=content_type, headers=headers)
+        return FileResponse(
+            path=str(file_path),
+            filename=filename,
+            media_type=content_type,
+            headers=headers,
+            background=BackgroundTask(_cleanup_temp_file, file_path),
+        )
 
     target = _resolve_library_file(settings, current_user["id"], subject_id, kind, name)
     return FileResponse(path=str(target), filename=target.name, media_type="application/octet-stream")
