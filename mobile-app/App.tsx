@@ -1885,16 +1885,29 @@ export default function App() {
     if (!authToken) {
       throw new Error('먼저 로그인해주세요.');
     }
-    const response = await fetch(`${apiBaseUrl}/api/library/sync`, {
-      method: 'POST',
-      headers: getAuthHeaders(),
-      body: formData,
-    });
-    const payload = await readJsonSafely(response);
-    if (!response.ok) {
-      throw new Error(getApiErrorMessage(payload, response, '서버 동기화 실패'));
+
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/library/sync`, {
+          method: 'POST',
+          headers: getAuthHeaders(),
+          body: formData,
+        });
+        const payload = await readJsonSafely(response);
+        if (!response.ok) {
+          throw new Error(getApiErrorMessage(payload, response, '서버 동기화 실패'));
+        }
+        return payload;
+      } catch (error) {
+        lastError = error;
+        if (attempt < 3) {
+          await delay(1000 * attempt);
+        }
+      }
     }
-    return payload;
+
+    throw new Error(`서버 동기화 실패(재시도 3회): ${formatError(lastError)}`);
   };
 
   const uploadAllFoldersToCloud = async () => {
@@ -2043,8 +2056,50 @@ export default function App() {
       }
 
       let downloadedFiles = 0;
+      const failedFiles: string[] = [];
       let firstSubjectId: string | null = null;
       ensureSubjectsRoot();
+
+      const downloadAndReplace = async (
+        subjectId: string,
+        kind: 'recording' | 'transcript' | 'translation' | 'summary',
+        name: string,
+        targetDir: Directory,
+      ): Promise<boolean> => {
+        const target = new File(targetDir, name);
+        const temp = new File(targetDir, `.__tmp__${Date.now()}-${Math.random().toString(36).slice(2)}-${name}`);
+        const url = `${apiBaseUrl}/api/library/file?subject_id=${encodeURIComponent(subjectId)}&kind=${encodeURIComponent(kind)}&name=${encodeURIComponent(name)}`;
+        let lastError: unknown = null;
+
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          try {
+            if (temp.exists) {
+              temp.delete();
+            }
+            await File.downloadFileAsync(url, temp, { headers: getAuthHeaders() });
+            if (!temp.exists) {
+              throw new Error('다운로드 임시 파일을 찾지 못했습니다.');
+            }
+            if (target.exists) {
+              target.delete();
+            }
+            temp.copy(target);
+            temp.delete();
+            return true;
+          } catch (error) {
+            lastError = error;
+            if (temp.exists) {
+              temp.delete();
+            }
+            if (attempt < 3) {
+              await delay(1200 * attempt);
+            }
+          }
+        }
+
+        failedFiles.push(`[${subjectId}] ${kind}/${name} - ${formatError(lastError)}`);
+        return false;
+      };
 
       for (let index = 0; index < cloudSubjects.length; index += 1) {
         const entry = cloudSubjects[index] as any;
@@ -2089,53 +2144,31 @@ export default function App() {
           ? entry.summaries.filter((value: unknown): value is string => typeof value === 'string')
           : [];
 
+        setStatusMessage(`서버 복원 중... (${index + 1}/${cloudSubjects.length}) ${subjectName}`);
+
         for (const name of recordings) {
-          const target = new File(paths.recordingsDir, name);
-          if (target.exists) {
-            target.delete();
+          const ok = await downloadAndReplace(subjectId, 'recording', name, paths.recordingsDir);
+          if (ok) {
+            downloadedFiles += 1;
           }
-          await File.downloadFileAsync(
-            `${apiBaseUrl}/api/library/file?subject_id=${encodeURIComponent(subjectId)}&kind=recording&name=${encodeURIComponent(name)}`,
-            target,
-            { headers: getAuthHeaders() },
-          );
-          downloadedFiles += 1;
         }
         for (const name of transcripts) {
-          const target = new File(paths.transcriptsDir, name);
-          if (target.exists) {
-            target.delete();
+          const ok = await downloadAndReplace(subjectId, 'transcript', name, paths.transcriptsDir);
+          if (ok) {
+            downloadedFiles += 1;
           }
-          await File.downloadFileAsync(
-            `${apiBaseUrl}/api/library/file?subject_id=${encodeURIComponent(subjectId)}&kind=transcript&name=${encodeURIComponent(name)}`,
-            target,
-            { headers: getAuthHeaders() },
-          );
-          downloadedFiles += 1;
         }
         for (const name of translations) {
-          const target = new File(paths.translationsDir, name);
-          if (target.exists) {
-            target.delete();
+          const ok = await downloadAndReplace(subjectId, 'translation', name, paths.translationsDir);
+          if (ok) {
+            downloadedFiles += 1;
           }
-          await File.downloadFileAsync(
-            `${apiBaseUrl}/api/library/file?subject_id=${encodeURIComponent(subjectId)}&kind=translation&name=${encodeURIComponent(name)}`,
-            target,
-            { headers: getAuthHeaders() },
-          );
-          downloadedFiles += 1;
         }
         for (const name of summaries) {
-          const target = new File(paths.summariesDir, name);
-          if (target.exists) {
-            target.delete();
+          const ok = await downloadAndReplace(subjectId, 'summary', name, paths.summariesDir);
+          if (ok) {
+            downloadedFiles += 1;
           }
-          await File.downloadFileAsync(
-            `${apiBaseUrl}/api/library/file?subject_id=${encodeURIComponent(subjectId)}&kind=summary&name=${encodeURIComponent(name)}`,
-            target,
-            { headers: getAuthHeaders() },
-          );
-          downloadedFiles += 1;
         }
       }
 
@@ -2144,7 +2177,11 @@ export default function App() {
         await loadSubjectFiles(firstSubjectId);
       }
       setScreenMode('home');
-      setStatusMessage(`서버 복원 완료 (파일 ${downloadedFiles}개)`);
+      if (failedFiles.length > 0) {
+        setStatusMessage(`서버 복원 완료 (성공 ${downloadedFiles}개, 실패 ${failedFiles.length}개)`);
+      } else {
+        setStatusMessage(`서버 복원 완료 (파일 ${downloadedFiles}개)`);
+      }
     } catch (error) {
       setStatusMessage(`서버 복원 실패: ${formatError(error)}`);
     } finally {
@@ -3291,6 +3328,10 @@ function recordingMimeType(fileName: string): string {
   if (lower.endsWith('.3gp')) return 'video/3gpp';
   if (lower.endsWith('.url')) return 'text/plain';
   return 'audio/m4a';
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function readJsonSafely(response: Response): Promise<any> {

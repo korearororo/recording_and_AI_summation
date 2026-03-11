@@ -84,30 +84,35 @@ class GoogleDriveLibraryStore:
         subject_name: str,
         meta: dict[str, object],
         uploads: list[UploadPayload],
+        entry_key: str | None = None,
     ) -> tuple[str, list[str]]:
         user_folder_id = self._find_or_create_folder(self._root_folder_id, f"user_{self._safe_segment(user_id)}")
         subject_folder_id = self._find_or_create_subject_folder(user_folder_id, subject_id, subject_name)
 
         saved_files: list[str] = []
-        kind_to_dir = {
-            "recording": "recordings",
-            "transcript": "transcripts",
-            "translation": "translations",
-            "summary": "summaries",
-        }
+        resolved_entry_key = self._safe_segment(entry_key or "")
+        if not resolved_entry_key:
+            for payload in uploads:
+                stem = Path(payload.file_name or "").stem.strip()
+                if stem:
+                    resolved_entry_key = self._safe_segment(stem)
+                    break
+        if not resolved_entry_key:
+            resolved_entry_key = self._safe_segment("item")
+
+        entry_dir_id = self._find_or_create_folder(subject_folder_id, resolved_entry_key)
 
         for payload in uploads:
-            if payload.kind not in kind_to_dir:
+            if payload.kind not in {"recording", "transcript", "translation", "summary"}:
                 continue
-            subdir_name = kind_to_dir[payload.kind]
-            subdir_id = self._find_or_create_folder(subject_folder_id, subdir_name)
+            stored_name = f"{payload.kind}__{payload.file_name}"
             self._upload_or_replace_file(
-                parent_id=subdir_id,
-                file_name=payload.file_name,
+                parent_id=entry_dir_id,
+                file_name=stored_name,
                 content=payload.content,
                 content_type=payload.content_type,
             )
-            saved_files.append(f"{subdir_name}/{payload.file_name}")
+            saved_files.append(f"entries/{resolved_entry_key}/{payload.kind}/{payload.file_name}")
 
         meta_bytes = json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
         self._upload_or_replace_file(
@@ -131,11 +136,11 @@ class GoogleDriveLibraryStore:
             folder_name = str(folder.get("name") or "")
             subject_folder_id = str(folder["id"])
             meta = self._read_meta_json(subject_folder_id)
-
-            recordings = self._list_files_in_subfolder(subject_folder_id, "recordings")
-            transcripts = self._list_files_in_subfolder(subject_folder_id, "transcripts")
-            translations = self._list_files_in_subfolder(subject_folder_id, "translations")
-            summaries = self._list_files_in_subfolder(subject_folder_id, "summaries")
+            grouped = self._collect_subject_files(subject_folder_id)
+            recordings = grouped["recordings"]
+            transcripts = grouped["transcripts"]
+            translations = grouped["translations"]
+            summaries = grouped["summaries"]
 
             subject_id = str(meta.get("id") or folder_name.split("__")[-1] or folder_name)
             subject_name = str(meta.get("name") or subject_id)
@@ -174,21 +179,22 @@ class GoogleDriveLibraryStore:
             raise FileNotFoundError("subject not found")
         subject_folder_id = str(subject_folder["id"])
 
-        kind_to_dir = {
-            "recording": "recordings",
-            "transcript": "transcripts",
-            "translation": "translations",
-            "summary": "summaries",
-        }
-        subfolder_name = kind_to_dir.get(kind)
-        if not subfolder_name:
+        if kind not in {"recording", "transcript", "translation", "summary"}:
             raise ValueError("kind must be one of: recording, transcript, translation, summary")
-        subfolder = self._find_folder(subject_folder_id, subfolder_name)
-        if subfolder is None:
-            raise FileNotFoundError("kind folder not found")
 
-        subfolder_id = str(subfolder["id"])
-        target_file = self._find_file(subfolder_id, file_name)
+        # New structure: subject/<entry>/<kind>__<filename>
+        target_file = self._find_file_in_entry_folders(subject_folder_id, f"{kind}__{file_name}")
+        # Backward compatibility: subject/<kind-folder>/<filename>
+        if target_file is None:
+            kind_to_dir = {
+                "recording": "recordings",
+                "transcript": "transcripts",
+                "translation": "translations",
+                "summary": "summaries",
+            }
+            subfolder = self._find_folder(subject_folder_id, kind_to_dir[kind])
+            if subfolder is not None:
+                target_file = self._find_file(str(subfolder["id"]), file_name)
         if target_file is None:
             raise FileNotFoundError("file not found")
 
@@ -294,6 +300,64 @@ class GoogleDriveLibraryStore:
             return str(existing["id"])
         folder_name = f"{self._safe_segment(subject_name or subject_id)}__{self._safe_segment(subject_id)}"
         return self._find_or_create_folder(user_folder_id, folder_name)
+
+    def _find_file_in_entry_folders(self, subject_folder_id: str, stored_name: str) -> dict[str, object] | None:
+        for entry_folder in self._list_child_folders(subject_folder_id):
+            entry_name = str(entry_folder.get("name") or "")
+            if entry_name in {"recordings", "transcripts", "translations", "summaries"}:
+                continue
+            found = self._find_file(str(entry_folder["id"]), stored_name)
+            if found is not None:
+                return found
+        return None
+
+    def _collect_subject_files(self, subject_folder_id: str) -> dict[str, list[str]]:
+        grouped: dict[str, set[str]] = {
+            "recordings": set(),
+            "transcripts": set(),
+            "translations": set(),
+            "summaries": set(),
+        }
+
+        for entry_folder in self._list_child_folders(subject_folder_id):
+            entry_name = str(entry_folder.get("name") or "")
+            if entry_name in {"recordings", "transcripts", "translations", "summaries"}:
+                continue
+            files = self._list_files(
+                query=(
+                    f"'{self._escape_query(str(entry_folder['id']))}' in parents and trashed = false "
+                    f"and mimeType != '{FOLDER_MIME}'"
+                ),
+                fields="files(name)",
+            )
+            for file_item in files:
+                raw_name = str(file_item.get("name") or "")
+                if "__" not in raw_name:
+                    continue
+                kind, original = raw_name.split("__", 1)
+                if not original:
+                    continue
+                if kind == "recording":
+                    grouped["recordings"].add(original)
+                elif kind == "transcript":
+                    grouped["transcripts"].add(original)
+                elif kind == "translation":
+                    grouped["translations"].add(original)
+                elif kind == "summary":
+                    grouped["summaries"].add(original)
+
+        # Backward compatibility for old flat-kind structure.
+        grouped["recordings"].update(self._list_files_in_subfolder(subject_folder_id, "recordings"))
+        grouped["transcripts"].update(self._list_files_in_subfolder(subject_folder_id, "transcripts"))
+        grouped["translations"].update(self._list_files_in_subfolder(subject_folder_id, "translations"))
+        grouped["summaries"].update(self._list_files_in_subfolder(subject_folder_id, "summaries"))
+
+        return {
+            "recordings": sorted(grouped["recordings"]),
+            "transcripts": sorted(grouped["transcripts"]),
+            "translations": sorted(grouped["translations"]),
+            "summaries": sorted(grouped["summaries"]),
+        }
 
     def _find_file(self, parent_id: str, file_name: str) -> dict[str, object] | None:
         escaped_parent = self._escape_query(parent_id)

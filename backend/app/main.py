@@ -290,6 +290,45 @@ def _safe_file_name(value: str, fallback: str) -> str:
     return candidate.replace("\\", "_").replace("/", "_")
 
 
+def _entry_key_from_names(*names: str | None) -> str:
+    for raw in names:
+        candidate = (raw or "").strip()
+        if not candidate:
+            continue
+        stem = Path(candidate).stem.strip()
+        if stem:
+            return _safe_segment(stem)
+    return _safe_segment(f"item-{uuid.uuid4().hex[:8]}")
+
+
+def _subject_entries_dir(target_dir: Path) -> Path:
+    entries_dir = target_dir / "entries"
+    entries_dir.mkdir(parents=True, exist_ok=True)
+    return entries_dir
+
+
+def _subject_entry_dir(target_dir: Path, entry_key: str) -> Path:
+    entry_dir = _subject_entries_dir(target_dir) / _safe_segment(entry_key)
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    return entry_dir
+
+
+def _entry_file_name(kind: str, file_name: str) -> str:
+    safe_name = _safe_file_name(file_name, "file.bin")
+    return f"{kind}__{safe_name}"
+
+
+def _parse_entry_file_name(raw_name: str) -> tuple[str, str] | None:
+    if "__" not in raw_name:
+        return None
+    kind, original = raw_name.split("__", 1)
+    if kind not in {"recording", "transcript", "translation", "summary"}:
+        return None
+    if not original:
+        return None
+    return kind, original
+
+
 def _find_subject_dir(root: Path, subject_id: str) -> Path | None:
     suffix = f"__{_safe_segment(subject_id)}"
     for entry in root.iterdir():
@@ -341,6 +380,49 @@ def _subject_data_dir(target_dir: Path, kind: str) -> Path:
     return data_dir
 
 
+def _collect_subject_files(target_dir: Path) -> dict[str, list[str]]:
+    grouped: dict[str, set[str]] = {
+        "recording": set(),
+        "transcript": set(),
+        "translation": set(),
+        "summary": set(),
+    }
+
+    entries_dir = target_dir / "entries"
+    if entries_dir.exists():
+        for entry_dir in entries_dir.iterdir():
+            if not entry_dir.is_dir():
+                continue
+            for child in entry_dir.iterdir():
+                if not child.is_file():
+                    continue
+                parsed = _parse_entry_file_name(child.name)
+                if parsed is None:
+                    continue
+                kind, original_name = parsed
+                grouped[kind].add(original_name)
+
+    # Backward compatibility for old flat-kind structure.
+    old_dirs = {
+        "recording": target_dir / "recordings",
+        "transcript": target_dir / "transcripts",
+        "translation": target_dir / "translations",
+        "summary": target_dir / "summaries",
+    }
+    for kind, old_dir in old_dirs.items():
+        if old_dir.exists():
+            for child in old_dir.iterdir():
+                if child.is_file():
+                    grouped[kind].add(child.name)
+
+    return {
+        "recordings": sorted(grouped["recording"]),
+        "transcripts": sorted(grouped["transcript"]),
+        "translations": sorted(grouped["translation"]),
+        "summaries": sorted(grouped["summary"]),
+    }
+
+
 def _resolve_library_file(settings: Settings, user_id: str, subject_id: str, kind: str, name: str) -> Path:
     root = _resolve_library_root(settings, user_id)
     subject_dir = _find_subject_dir(root, subject_id)
@@ -348,10 +430,21 @@ def _resolve_library_file(settings: Settings, user_id: str, subject_id: str, kin
         raise HTTPException(status_code=404, detail="subject not found")
 
     safe_name = _safe_file_name(name, "file.bin")
-    target = _subject_data_dir(subject_dir, kind) / safe_name
-    if not target.exists():
-        raise HTTPException(status_code=404, detail="file not found")
-    return target
+    entries_dir = subject_dir / "entries"
+    if entries_dir.exists():
+        prefixed = _entry_file_name(kind, safe_name)
+        for entry_dir in entries_dir.iterdir():
+            if not entry_dir.is_dir():
+                continue
+            candidate = entry_dir / prefixed
+            if candidate.exists():
+                return candidate
+
+    # Backward compatibility for old flat-kind structure.
+    legacy_target = _subject_data_dir(subject_dir, kind) / safe_name
+    if legacy_target.exists():
+        return legacy_target
+    raise HTTPException(status_code=404, detail="file not found")
 
 
 def _copy_upload_to(upload: UploadFile, target_path: Path) -> None:
@@ -1141,6 +1234,7 @@ def sync_subject_files_to_library(
     current_user: dict[str, str] = Depends(_require_user),
 ) -> LibrarySyncResponse:
     saved_files: list[str] = []
+    entry_key = _entry_key_from_names(recording_name, transcript_name, translation_name, summary_name)
 
     try:
         if _use_google_drive_library(settings):
@@ -1202,30 +1296,32 @@ def sync_subject_files_to_library(
                 subject_name=subject_name,
                 meta=meta,
                 uploads=uploads,
+                entry_key=entry_key,
             )
         else:
             target_dir = _subject_library_dir(settings, subject_id, subject_name, current_user["id"])
+            entry_dir = _subject_entry_dir(target_dir, entry_key)
 
             if recording is not None:
                 file_name = _safe_file_name(recording_name or recording.filename or "recording.m4a", "recording.m4a")
-                recording_target = _subject_data_dir(target_dir, "recording") / file_name
+                recording_target = entry_dir / _entry_file_name("recording", file_name)
                 _copy_upload_to(recording, recording_target)
-                saved_files.append(f"recordings/{file_name}")
+                saved_files.append(f"entries/{entry_key}/recording/{file_name}")
             if transcript is not None:
                 file_name = _safe_file_name(transcript_name or transcript.filename or "transcript.txt", "transcript.txt")
-                transcript_target = _subject_data_dir(target_dir, "transcript") / file_name
+                transcript_target = entry_dir / _entry_file_name("transcript", file_name)
                 _copy_upload_to(transcript, transcript_target)
-                saved_files.append(f"transcripts/{file_name}")
+                saved_files.append(f"entries/{entry_key}/transcript/{file_name}")
             if translation is not None:
                 file_name = _safe_file_name(translation_name or translation.filename or "translation.txt", "translation.txt")
-                translation_target = _subject_data_dir(target_dir, "translation") / file_name
+                translation_target = entry_dir / _entry_file_name("translation", file_name)
                 _copy_upload_to(translation, translation_target)
-                saved_files.append(f"translations/{file_name}")
+                saved_files.append(f"entries/{entry_key}/translation/{file_name}")
             if summary is not None:
                 file_name = _safe_file_name(summary_name or summary.filename or "summary.txt", "summary.txt")
-                summary_target = _subject_data_dir(target_dir, "summary") / file_name
+                summary_target = entry_dir / _entry_file_name("summary", file_name)
                 _copy_upload_to(summary, summary_target)
-                saved_files.append(f"summaries/{file_name}")
+                saved_files.append(f"entries/{entry_key}/summary/{file_name}")
 
             meta = _load_subject_meta(target_dir)
             if not meta.get("created_at"):
@@ -1277,20 +1373,12 @@ def list_library(
     for entry in sorted(root.iterdir()):
         if not entry.is_dir():
             continue
-        recordings_dir = entry / "recordings"
-        transcripts_dir = entry / "transcripts"
-        translations_dir = entry / "translations"
-        summaries_dir = entry / "summaries"
         meta = _load_subject_meta(entry)
-
-        recordings = sorted([p.name for p in recordings_dir.iterdir() if p.is_file()]) if recordings_dir.exists() else []
-        transcripts = (
-            sorted([p.name for p in transcripts_dir.iterdir() if p.is_file()]) if transcripts_dir.exists() else []
-        )
-        translations = (
-            sorted([p.name for p in translations_dir.iterdir() if p.is_file()]) if translations_dir.exists() else []
-        )
-        summaries = sorted([p.name for p in summaries_dir.iterdir() if p.is_file()]) if summaries_dir.exists() else []
+        files = _collect_subject_files(entry)
+        recordings = files["recordings"]
+        transcripts = files["transcripts"]
+        translations = files["translations"]
+        summaries = files["summaries"]
         subject_id = str(meta.get("id") or entry.name.split("__")[-1])
         subject_name = str(meta.get("name") or subject_id)
         subjects.append(
