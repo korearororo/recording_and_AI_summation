@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -202,6 +203,34 @@ class GoogleDriveLibraryStore:
         content = self._download_file(file_id)
         content_type = str(target_file.get("mimeType") or "application/octet-stream")
         return content, file_name, content_type
+
+    def archive_and_clear_user_library(self, user_id: str) -> dict[str, object]:
+        user_folder_name = f"user_{self._safe_segment(user_id)}"
+        user_folder = self._find_folder(self._root_folder_id, user_folder_name)
+        if user_folder is None:
+            return {"archive_dir": "", "moved_items": 0}
+
+        user_folder_id = str(user_folder["id"])
+        archive_name = f"archive_{user_folder_name}_{int(time.time())}"
+        archive_id = self._find_or_create_folder(self._root_folder_id, archive_name)
+
+        query = f"'{self._escape_query(user_folder_id)}' in parents and trashed = false"
+        items = self._list_files(query, fields="files(id,name,mimeType,parents)")
+        moved = 0
+        for item in items:
+            file_id = str(item.get("id") or "")
+            if not file_id:
+                continue
+            self._drive.files().update(
+                fileId=file_id,
+                addParents=archive_id,
+                removeParents=user_folder_id,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            moved += 1
+
+        return {"archive_dir": f"drive://folder/{archive_id}", "moved_items": moved}
 
     def _load_service_account_info(self, raw: str) -> dict[str, object]:
         value = raw.strip()

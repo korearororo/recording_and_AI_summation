@@ -447,6 +447,25 @@ def _resolve_library_file(settings: Settings, user_id: str, subject_id: str, kin
     raise HTTPException(status_code=404, detail="file not found")
 
 
+def _archive_local_user_library(settings: Settings, user_id: str) -> dict[str, object]:
+    root = _resolve_library_root(settings, user_id)
+    entries = [entry for entry in root.iterdir()]
+    if not entries:
+        return {"archive_dir": "", "moved_items": 0}
+
+    archive_dir = root.parent / f"{root.name}_archive_{int(time.time())}"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for entry in entries:
+        target = archive_dir / entry.name
+        if target.exists():
+            target = archive_dir / f"{entry.name}_{uuid.uuid4().hex[:6]}"
+        shutil.move(str(entry), str(target))
+        moved += 1
+
+    return {"archive_dir": str(archive_dir.resolve()), "moved_items": moved}
+
+
 def _copy_upload_to(upload: UploadFile, target_path: Path) -> None:
     with target_path.open("wb") as out_file:
         shutil.copyfileobj(upload.file, out_file)
@@ -1403,6 +1422,20 @@ def list_library(
         )
 
     return {"root_dir": str(root.resolve()), "subjects": subjects}
+
+
+@app.post("/api/library/archive")
+def archive_and_clear_library(
+    settings: Settings = Depends(get_settings),
+    current_user: dict[str, str] = Depends(_require_user),
+) -> dict[str, object]:
+    try:
+        if _use_google_drive_library(settings):
+            drive_store = _get_google_drive_store(settings)
+            return drive_store.archive_and_clear_user_library(current_user["id"])
+        return _archive_local_user_library(settings, current_user["id"])
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Library archive failed: {exc}") from exc
 
 
 @app.get("/api/library/file")

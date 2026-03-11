@@ -2189,6 +2189,51 @@ export default function App() {
     }
   };
 
+  const archiveAndClearCloudLibrary = async () => {
+    if (!authToken) {
+      setAuthMode('login');
+      setAuthModalVisible(true);
+      setStatusMessage('먼저 로그인해주세요.');
+      return;
+    }
+
+    Alert.alert('클라우드 비우기', '현재 서버 파일을 백업 폴더로 이동하고 서버 폴더를 비울까요?', [
+      { text: '취소', style: 'cancel' },
+      {
+        text: '진행',
+        style: 'destructive',
+        onPress: () => {
+          void (async () => {
+            try {
+              setIsBusy(true);
+              setStatusMessage('서버 파일 백업/정리 중...');
+              const response = await fetch(`${apiBaseUrl}/api/library/archive`, {
+                method: 'POST',
+                headers: getAuthHeaders(),
+              });
+              const payload = await readJsonSafely(response);
+              if (!response.ok) {
+                throw new Error(getApiErrorMessage(payload, response, '서버 정리 실패'));
+              }
+
+              const moved = Number(payload?.moved_items ?? 0);
+              const archiveDir = typeof payload?.archive_dir === 'string' ? payload.archive_dir : '';
+              setStatusMessage(
+                archiveDir
+                  ? `서버 정리 완료 (이동 ${moved}개) - 백업: ${archiveDir}`
+                  : `서버 정리 완료 (이동 ${moved}개)`,
+              );
+            } catch (error) {
+              setStatusMessage(`서버 정리 실패: ${formatError(error)}`);
+            } finally {
+              setIsBusy(false);
+            }
+          })();
+        },
+      },
+    ]);
+  };
+
   const exportSubjectFile = async (kind: 'recording' | 'transcript' | 'translation' | 'summary') => {
     if (!selectedSubject || !selectedRecording) {
       setStatusMessage('파일을 선택해주세요.');
@@ -2358,6 +2403,13 @@ export default function App() {
                   <Text style={styles.cloudSyncButtonText}>서버에서 복원</Text>
                 </Pressable>
               </View>
+              <Pressable
+                style={[styles.cloudArchiveButton, isBusy && styles.disabledButton]}
+                onPress={archiveAndClearCloudLibrary}
+                disabled={isBusy}
+              >
+                <Text style={styles.cloudArchiveButtonText}>클라우드 비우기 (백업 이동)</Text>
+              </Pressable>
               <View style={styles.subjectList}>
                 {subjects.length === 0 ? <Text style={styles.helper}>저장된 폴더가 없습니다.</Text> : null}
                 {subjects.map((subject) => (
@@ -3572,6 +3624,20 @@ const styles = StyleSheet.create({
   },
   cloudSyncButtonText: {
     color: '#1E3A8A',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  cloudArchiveButton: {
+    marginTop: 8,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#FCA5A5',
+    backgroundColor: '#FFF1F2',
+    paddingVertical: 10,
+    alignItems: 'center',
+  },
+  cloudArchiveButtonText: {
+    color: '#9F1239',
     fontSize: 12,
     fontWeight: '800',
   },
