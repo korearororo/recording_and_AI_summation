@@ -2250,12 +2250,6 @@ export default function App() {
                 skippedFiles += 1;
                 return;
               }
-            } else if (fileMeta.size > 0) {
-              const localSize = getLocalFileSignature(target).size;
-              if (localSize === fileMeta.size) {
-                skippedFiles += 1;
-                return;
-              }
             }
           }
           restoreTasks.push(() => downloadAndReplace(subjectId, kind, name, targetDir, fileMeta.md5));
@@ -2279,6 +2273,43 @@ export default function App() {
             setStatusMessage(`서버 복원 중... (${index + 1}/${cloudSubjects.length}) ${subjectName} ${done}/${total}`);
           });
           downloadedFiles += results.filter(Boolean).length;
+        }
+
+        const forceMissingTasks: Array<() => Promise<boolean>> = [];
+        const ensureMissing = (
+          kind: 'recording' | 'transcript' | 'translation' | 'summary',
+          fileMeta: CloudFileMeta,
+          targetDir: Directory,
+        ) => {
+          const name = fileMeta.name;
+          if (!name) {
+            return;
+          }
+          const target = new File(targetDir, name);
+          if (!target.exists) {
+            forceMissingTasks.push(() => downloadAndReplace(subjectId, kind, name, targetDir, fileMeta.md5));
+          }
+        };
+        for (const fileMeta of entry.recordings) {
+          ensureMissing('recording', fileMeta, paths.recordingsDir);
+        }
+        for (const fileMeta of entry.transcripts) {
+          ensureMissing('transcript', fileMeta, paths.transcriptsDir);
+        }
+        for (const fileMeta of entry.translations) {
+          ensureMissing('translation', fileMeta, paths.translationsDir);
+        }
+        for (const fileMeta of entry.summaries) {
+          ensureMissing('summary', fileMeta, paths.summariesDir);
+        }
+        if (forceMissingTasks.length > 0) {
+          const retryConcurrency = Math.max(1, Math.floor(CLOUD_RESTORE_CONCURRENCY / 2));
+          const forceResults = await runTasksWithConcurrency(forceMissingTasks, retryConcurrency, (done, total) => {
+            setStatusMessage(
+              `서버 복원 재시도 중... (${index + 1}/${cloudSubjects.length}) ${subjectName} ${done}/${total}`,
+            );
+          });
+          downloadedFiles += forceResults.filter(Boolean).length;
         }
       }
 
