@@ -175,7 +175,14 @@ class GoogleDriveLibraryStore:
         subjects.sort(key=lambda item: str(item.get("folder") or ""))
         return {"root_dir": f"drive://folder/{user_folder_id}", "subjects": subjects}
 
-    def download_subject_file(self, user_id: str, subject_id: str, kind: str, file_name: str) -> tuple[bytes, str, str]:
+    def download_subject_file(
+        self,
+        user_id: str,
+        subject_id: str,
+        kind: str,
+        file_name: str,
+        file_id: str | None = None,
+    ) -> tuple[bytes, str, str]:
         user_folder = self._find_folder(self._root_folder_id, f"user_{self._safe_segment(user_id)}")
         if user_folder is None:
             raise FileNotFoundError("user folder not found")
@@ -188,6 +195,25 @@ class GoogleDriveLibraryStore:
 
         if kind not in {"recording", "transcript", "translation", "summary"}:
             raise ValueError("kind must be one of: recording, transcript, translation, summary")
+
+        requested_file_id = (file_id or "").strip()
+        if requested_file_id:
+            try:
+                direct_file = (
+                    self._drive.files()
+                    .get(fileId=requested_file_id, fields="id,name,mimeType", supportsAllDrives=True)
+                    .execute()
+                )
+                direct_name = str(direct_file.get("name") or file_name)
+                if "__" in direct_name:
+                    _, original = direct_name.split("__", 1)
+                    direct_name = original or file_name
+                content = self._download_file(requested_file_id)
+                content_type = str(direct_file.get("mimeType") or "application/octet-stream")
+                return content, (file_name or direct_name), content_type
+            except Exception:
+                # Fallback to legacy name-based lookup.
+                pass
 
         # New structure: subject/<entry>/<kind>__<filename>
         target_file = self._find_file_in_entry_folders(subject_folder_id, f"{kind}__{file_name}")
@@ -378,7 +404,7 @@ class GoogleDriveLibraryStore:
                     f"'{self._escape_query(str(entry_folder['id']))}' in parents and trashed = false "
                     f"and mimeType != '{FOLDER_MIME}'"
                 ),
-                fields="files(name,md5Checksum,size,modifiedTime)",
+                fields="files(id,name,md5Checksum,size,modifiedTime)",
             )
             for file_item in files:
                 raw_name = str(file_item.get("name") or "")
@@ -485,7 +511,7 @@ class GoogleDriveLibraryStore:
             f"'{self._escape_query(subfolder_id)}' in parents and trashed = false "
             f"and mimeType != '{FOLDER_MIME}'"
         )
-        items = self._list_files(query, fields="files(name,md5Checksum,size,modifiedTime)")
+        items = self._list_files(query, fields="files(id,name,md5Checksum,size,modifiedTime)")
         normalized: list[dict[str, object]] = []
         for item in items:
             name = str(item.get("name") or "")
@@ -493,6 +519,7 @@ class GoogleDriveLibraryStore:
                 continue
             normalized.append(
                 {
+                    "id": str(item.get("id") or ""),
                     "name": name,
                     "md5Checksum": str(item.get("md5Checksum") or ""),
                     "size": item.get("size"),
@@ -519,6 +546,7 @@ class GoogleDriveLibraryStore:
 
         return {
             "name": file_name,
+            "file_id": str(file_item.get("id") or ""),
             "md5": str(file_item.get("md5Checksum") or ""),
             "size": size,
             "updated_at": updated_at,

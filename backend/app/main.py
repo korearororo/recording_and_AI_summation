@@ -468,7 +468,7 @@ def _file_meta_row(name: str, path: Path) -> dict[str, object]:
         size = 0
         updated_at = 0.0
         md5 = ""
-    return {"name": name, "md5": md5, "size": size, "updated_at": updated_at}
+    return {"name": name, "file_id": "", "md5": md5, "size": size, "updated_at": updated_at}
 
 
 def _resolve_library_file(settings: Settings, user_id: str, subject_id: str, kind: str, name: str) -> Path:
@@ -1495,6 +1495,7 @@ def download_library_file(
     subject_id: str = Query(...),
     kind: str = Query(...),
     name: str = Query(...),
+    file_id: str | None = Query(default=None),
     settings: Settings = Depends(get_settings),
     current_user: dict[str, str] = Depends(_require_user),
 ) -> Response:
@@ -1506,6 +1507,7 @@ def download_library_file(
                 subject_id=subject_id,
                 kind=kind,
                 file_name=name,
+                file_id=file_id,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

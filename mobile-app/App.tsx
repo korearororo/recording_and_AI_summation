@@ -109,6 +109,7 @@ type SocialProvider = 'kakao' | 'google' | 'naver';
 
 type CloudFileMeta = {
   name: string;
+  fileId: string;
   md5: string;
   size: number;
   updatedAt: number;
@@ -2158,10 +2159,19 @@ export default function App() {
         name: string,
         targetDir: Directory,
         expectedMd5?: string,
+        remoteFileId?: string,
       ): Promise<boolean> => {
         const target = new File(targetDir, name);
         const temp = new File(targetDir, `.__tmp__${Date.now()}-${Math.random().toString(36).slice(2)}-${name}`);
-        const url = `${apiBaseUrl}/api/library/file?subject_id=${encodeURIComponent(subjectId)}&kind=${encodeURIComponent(kind)}&name=${encodeURIComponent(name)}`;
+        const query = [
+          `subject_id=${encodeURIComponent(subjectId)}`,
+          `kind=${encodeURIComponent(kind)}`,
+          `name=${encodeURIComponent(name)}`,
+        ];
+        if (remoteFileId && remoteFileId.trim()) {
+          query.push(`file_id=${encodeURIComponent(remoteFileId.trim())}`);
+        }
+        const url = `${apiBaseUrl}/api/library/file?${query.join('&')}`;
         let lastError: unknown = null;
 
         for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -2252,7 +2262,7 @@ export default function App() {
               }
             }
           }
-          restoreTasks.push(() => downloadAndReplace(subjectId, kind, name, targetDir, fileMeta.md5));
+          restoreTasks.push(() => downloadAndReplace(subjectId, kind, name, targetDir, fileMeta.md5, fileMeta.fileId));
         };
 
         for (const fileMeta of entry.recordings) {
@@ -2287,7 +2297,9 @@ export default function App() {
           }
           const target = new File(targetDir, name);
           if (!target.exists) {
-            forceMissingTasks.push(() => downloadAndReplace(subjectId, kind, name, targetDir, fileMeta.md5));
+            forceMissingTasks.push(() =>
+              downloadAndReplace(subjectId, kind, name, targetDir, fileMeta.md5, fileMeta.fileId),
+            );
           }
         };
         for (const fileMeta of entry.recordings) {
@@ -2321,7 +2333,10 @@ export default function App() {
       }
       setScreenMode('home');
       if (failedFiles.length > 0) {
-        setStatusMessage(`서버 복원 완료 (다운로드 ${downloadedFiles}개, 스킵 ${skippedFiles}개, 실패 ${failedFiles.length}개)`);
+        const firstFailure = failedFiles[0]?.slice(0, 120) ?? '';
+        setStatusMessage(
+          `서버 복원 완료 (다운로드 ${downloadedFiles}개, 스킵 ${skippedFiles}개, 실패 ${failedFiles.length}개)${firstFailure ? ` / 첫 실패: ${firstFailure}` : ''}`,
+        );
       } else {
         setStatusMessage(`서버 복원 완료 (다운로드 ${downloadedFiles}개, 스킵 ${skippedFiles}개)`);
       }
@@ -3607,6 +3622,7 @@ function toCloudFileMetaArray(rawMeta: unknown, fallbackNames: string[]): CloudF
       const updatedRaw = Number(value.updated_at ?? value.updatedAt ?? 0);
       map.set(name, {
         name,
+        fileId: typeof value.file_id === 'string' ? value.file_id.trim() : typeof value.id === 'string' ? value.id.trim() : '',
         md5,
         size: Number.isFinite(sizeRaw) && sizeRaw > 0 ? Math.floor(sizeRaw) : 0,
         updatedAt: Number.isFinite(updatedRaw) && updatedRaw > 0 ? updatedRaw : 0,
@@ -3622,7 +3638,7 @@ function toCloudFileMetaArray(rawMeta: unknown, fallbackNames: string[]): CloudF
     if (!name || map.has(name)) {
       continue;
     }
-    map.set(name, { name, md5: '', size: 0, updatedAt: 0 });
+    map.set(name, { name, fileId: '', md5: '', size: 0, updatedAt: 0 });
   }
 
   return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
