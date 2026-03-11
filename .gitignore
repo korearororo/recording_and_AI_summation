@@ -12,3 +12,10 @@ mobile-app/.env
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Local automation/browser profile noise
+.pw-coupang-profile/
+
+# Local personal folders outside this project scope
+새 폴더/
+스칼렛 바이올렛/
