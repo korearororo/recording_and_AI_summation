@@ -2,6 +2,7 @@
 import {
   ActivityIndicator,
   Alert,
+  BackHandler,
   Modal,
   Platform,
   Pressable,
@@ -46,6 +47,7 @@ type SubjectMeta = {
   tag?: SubjectTag;
   icon?: string;
   color?: string;
+  order?: number;
   createdAt: number;
 };
 
@@ -55,6 +57,7 @@ type SubjectItem = {
   tag: SubjectTag;
   icon: string;
   color: string;
+  order: number;
   hasRecording: boolean;
   hasTranscript: boolean;
   hasTranslation: boolean;
@@ -160,6 +163,8 @@ export default function App() {
   const [subjects, setSubjects] = useState<SubjectItem[]>([]);
   const [selectedSubjectId, setSelectedSubjectId] = useState<string | null>(null);
   const [folderModalVisible, setFolderModalVisible] = useState(false);
+  const [folderModalMode, setFolderModalMode] = useState<'create' | 'edit'>('create');
+  const [editingFolderId, setEditingFolderId] = useState<string | null>(null);
   const [newFolderName, setNewFolderName] = useState('');
   const [newFolderIcon, setNewFolderIcon] = useState(DEFAULT_FOLDER_ICON);
   const [newFolderColor, setNewFolderColor] = useState(DEFAULT_FOLDER_COLOR);
@@ -200,6 +205,7 @@ export default function App() {
 
   const [statusMessage, setStatusMessage] = useState('준비 완료');
   const [isBusy, setIsBusy] = useState(false);
+  const [recordActionBusy, setRecordActionBusy] = useState(false);
   const [libraryPath, setLibraryPath] = useState('');
   const [librarySavedFiles, setLibrarySavedFiles] = useState<string[]>([]);
   const [authModalVisible, setAuthModalVisible] = useState(false);
@@ -292,6 +298,65 @@ export default function App() {
     void loadSubjectFiles(selectedSubjectId, selectedRecordingId);
   }, [selectedSubjectId]);
 
+  useEffect(() => {
+    if (Platform.OS !== 'android') {
+      return;
+    }
+
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (editorVisible) {
+        closeEditorModal();
+        return true;
+      }
+      if (renameVisible) {
+        setRenameVisible(false);
+        return true;
+      }
+      if (authModalVisible) {
+        setAuthModalVisible(false);
+        return true;
+      }
+      if (folderModalVisible) {
+        closeFolderModal();
+        return true;
+      }
+      if (recordingSaveVisible) {
+        cancelRecordingSave();
+        return true;
+      }
+      if (uploadModalVisible) {
+        setUploadModalVisible(false);
+        return true;
+      }
+      if (fabOpen) {
+        setFabOpen(false);
+        return true;
+      }
+      if (screenMode === 'detail') {
+        setScreenMode('subject');
+        return true;
+      }
+      if (screenMode === 'subject' || screenMode === 'record') {
+        setScreenMode('home');
+        return true;
+      }
+      return false;
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [
+    authModalVisible,
+    editorVisible,
+    fabOpen,
+    folderModalVisible,
+    recordingSaveVisible,
+    renameVisible,
+    screenMode,
+    uploadModalVisible,
+  ]);
+
   const initialize = async () => {
     ensureSubjectsRoot();
     await setupNotifications();
@@ -329,6 +394,7 @@ export default function App() {
       const paths = getSubjectPaths(id);
       paths.dir.create({ idempotent: true, intermediates: true });
       ensureRecordingDirs(paths);
+      const nextOrder = Math.max(0, ...subjects.map((subject) => subject.order || 0)) + 1;
 
       const meta: SubjectMeta = {
         id,
@@ -336,10 +402,13 @@ export default function App() {
         tag: 'major',
         icon: newFolderIcon || DEFAULT_FOLDER_ICON,
         color: normalizeFolderColor(newFolderColor),
+        order: nextOrder,
         createdAt: Date.now(),
       };
       writeText(paths.meta, JSON.stringify(meta, null, 2));
 
+      setFolderModalMode('create');
+      setEditingFolderId(null);
       setNewFolderName('');
       setNewFolderIcon(DEFAULT_FOLDER_ICON);
       setNewFolderColor(DEFAULT_FOLDER_COLOR);
@@ -350,6 +419,142 @@ export default function App() {
     } catch (error) {
       setStatusMessage(`폴더 생성 실패: ${formatError(error)}`);
     }
+  };
+
+  const updateSubject = async () => {
+    const targetId = editingFolderId;
+    if (!targetId) {
+      setStatusMessage('수정할 폴더를 선택해주세요.');
+      return;
+    }
+
+    const name = newFolderName.trim();
+    if (!name) {
+      setStatusMessage('폴더 이름을 입력해주세요.');
+      return;
+    }
+
+    try {
+      ensureSubjectsRoot();
+      const paths = getSubjectPaths(targetId);
+      if (!paths.dir.exists) {
+        throw new Error('폴더가 존재하지 않습니다.');
+      }
+      const currentMeta = await readMeta(paths.meta);
+      const meta: SubjectMeta = {
+        id: targetId,
+        name,
+        tag: currentMeta?.tag ?? 'major',
+        icon: newFolderIcon || DEFAULT_FOLDER_ICON,
+        color: normalizeFolderColor(newFolderColor),
+        order: normalizeSubjectOrder(currentMeta?.order) ?? Math.max(0, ...subjects.map((subject) => subject.order || 0)) + 1,
+        createdAt: currentMeta?.createdAt ?? Date.now(),
+      };
+      writeText(paths.meta, JSON.stringify(meta, null, 2));
+
+      setFolderModalMode('create');
+      setEditingFolderId(null);
+      setNewFolderName('');
+      setNewFolderIcon(DEFAULT_FOLDER_ICON);
+      setNewFolderColor(DEFAULT_FOLDER_COLOR);
+      setFolderModalVisible(false);
+      await loadSubjects(targetId);
+      setStatusMessage(`폴더 수정 완료: ${meta.icon} ${name}`);
+    } catch (error) {
+      setStatusMessage(`폴더 수정 실패: ${formatError(error)}`);
+    }
+  };
+
+  const openCreateFolderModal = () => {
+    setFolderModalMode('create');
+    setEditingFolderId(null);
+    setNewFolderName('');
+    setNewFolderIcon(DEFAULT_FOLDER_ICON);
+    setNewFolderColor(DEFAULT_FOLDER_COLOR);
+    setFolderModalVisible(true);
+  };
+
+  const closeFolderModal = () => {
+    setFolderModalVisible(false);
+    setFolderModalMode('create');
+    setEditingFolderId(null);
+  };
+
+  const openEditFolderModal = (subject: SubjectItem) => {
+    setFolderModalMode('edit');
+    setEditingFolderId(subject.id);
+    setNewFolderName(subject.name);
+    setNewFolderIcon(subject.icon || DEFAULT_FOLDER_ICON);
+    setNewFolderColor(normalizeFolderColor(subject.color || DEFAULT_FOLDER_COLOR));
+    setFolderModalVisible(true);
+  };
+
+  const moveSubject = async (subjectId: string, direction: 'up' | 'down') => {
+    const index = subjects.findIndex((subject) => subject.id === subjectId);
+    if (index < 0) {
+      return;
+    }
+    const targetIndex = direction === 'up' ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= subjects.length) {
+      setStatusMessage(direction === 'up' ? '이미 맨 위 폴더입니다.' : '이미 맨 아래 폴더입니다.');
+      return;
+    }
+
+    try {
+      const reordered = [...subjects];
+      const [moved] = reordered.splice(index, 1);
+      reordered.splice(targetIndex, 0, moved);
+
+      for (let i = 0; i < reordered.length; i += 1) {
+        const subject = reordered[i];
+        const paths = getSubjectPaths(subject.id);
+        const currentMeta = await readMeta(paths.meta);
+        const meta: SubjectMeta = {
+          id: subject.id,
+          name: currentMeta?.name ?? subject.name,
+          tag: currentMeta?.tag ?? subject.tag,
+          icon: currentMeta?.icon ?? subject.icon,
+          color: normalizeFolderColor(currentMeta?.color ?? subject.color),
+          order: i + 1,
+          createdAt: currentMeta?.createdAt ?? Date.now(),
+        };
+        writeText(paths.meta, JSON.stringify(meta, null, 2));
+      }
+
+      await loadSubjects(subjectId);
+      setStatusMessage(`폴더 순서 변경 완료: ${moved.name}`);
+    } catch (error) {
+      setStatusMessage(`폴더 순서 변경 실패: ${formatError(error)}`);
+    }
+  };
+
+  const deleteSubject = async (subject: SubjectItem) => {
+    Alert.alert('폴더 삭제 확인', `"${subject.name}" 폴더와 내부 파일을 모두 삭제할까요?`, [
+      { text: '취소', style: 'cancel' },
+      {
+        text: '삭제',
+        style: 'destructive',
+        onPress: () => {
+          void (async () => {
+            try {
+              setIsBusy(true);
+              const paths = getSubjectPaths(subject.id);
+              removeDirectoryRecursive(paths.dir);
+              if (selectedSubjectId === subject.id) {
+                setSelectedSubjectId(null);
+                setScreenMode('home');
+              }
+              await loadSubjects();
+              setStatusMessage(`폴더 삭제 완료: ${subject.name}`);
+            } catch (error) {
+              setStatusMessage(`폴더 삭제 실패: ${formatError(error)}`);
+            } finally {
+              setIsBusy(false);
+            }
+          })();
+        },
+      },
+    ]);
   };
 
   const openDirectory = (subjectId: string) => {
@@ -964,6 +1169,7 @@ export default function App() {
 
   const startRecording = async () => {
     try {
+      setRecordActionBusy(true);
       setStatusMessage('권한 확인 중...');
       await ensurePermissions();
       await setAudioModeAsync({
@@ -975,15 +1181,18 @@ export default function App() {
       });
 
       await recorder.prepareToRecordAsync(LECTURE_RECORDING_PRESET as any);
-      recorder.record();
+      await recorder.record();
       setStatusMessage('녹음 중 (백그라운드 지속)');
     } catch (error) {
       setStatusMessage(`녹음 시작 실패: ${formatError(error)}`);
+    } finally {
+      setRecordActionBusy(false);
     }
   };
 
   const stopRecording = async () => {
     try {
+      setRecordActionBusy(true);
       setStatusMessage('녹음 종료 중...');
       await recorder.stop();
 
@@ -1011,6 +1220,8 @@ export default function App() {
       setStatusMessage('녹음 완료. 파일명/저장 폴더를 선택해주세요.');
     } catch (error) {
       setStatusMessage(`녹음 중지 실패: ${formatError(error)}`);
+    } finally {
+      setRecordActionBusy(false);
     }
   };
 
@@ -1713,6 +1924,7 @@ export default function App() {
         const subjectTag = meta?.tag ?? 'major';
         const subjectIcon = meta?.icon ?? DEFAULT_FOLDER_ICON;
         const subjectColor = meta?.color ?? DEFAULT_FOLDER_COLOR;
+        const subjectOrder = normalizeSubjectOrder(meta?.order) ?? 999999;
 
         const metaForm = new FormData();
         metaForm.append('subject_id', subjectId);
@@ -1720,6 +1932,7 @@ export default function App() {
         metaForm.append('subject_tag', subjectTag);
         metaForm.append('subject_icon', subjectIcon);
         metaForm.append('subject_color', subjectColor);
+        metaForm.append('subject_order', String(subjectOrder));
         await postLibrarySync(metaForm);
 
         const items = listRecordingItems(paths);
@@ -1731,6 +1944,7 @@ export default function App() {
           unitForm.append('subject_tag', subjectTag);
           unitForm.append('subject_icon', subjectIcon);
           unitForm.append('subject_color', subjectColor);
+          unitForm.append('subject_order', String(subjectOrder));
 
           let hasAny = false;
           if (item.recordingFile.exists) {
@@ -1832,7 +2046,8 @@ export default function App() {
       let firstSubjectId: string | null = null;
       ensureSubjectsRoot();
 
-      for (const entry of cloudSubjects as any[]) {
+      for (let index = 0; index < cloudSubjects.length; index += 1) {
+        const entry = cloudSubjects[index] as any;
         const subjectId = String(entry.subject_id ?? '').trim();
         if (!subjectId) {
           continue;
@@ -1845,6 +2060,7 @@ export default function App() {
         const subjectTag = normalizeSubjectTag(String(entry.subject_tag ?? 'major'));
         const subjectIcon = String(entry.subject_icon ?? DEFAULT_FOLDER_ICON) || DEFAULT_FOLDER_ICON;
         const subjectColor = normalizeFolderColor(String(entry.subject_color ?? DEFAULT_FOLDER_COLOR));
+        const subjectOrder = normalizeSubjectOrder(entry.subject_order) ?? index + 1;
 
         const paths = getSubjectPaths(subjectId);
         paths.dir.create({ idempotent: true, intermediates: true });
@@ -1855,6 +2071,7 @@ export default function App() {
           tag: subjectTag,
           icon: subjectIcon,
           color: subjectColor,
+          order: subjectOrder,
           createdAt: Date.now(),
         };
         writeText(paths.meta, JSON.stringify(meta, null, 2));
@@ -1997,6 +2214,7 @@ export default function App() {
         tag: meta?.tag ?? 'major',
         icon: meta?.icon ?? DEFAULT_FOLDER_ICON,
         color: normalizeFolderColor(meta?.color ?? DEFAULT_FOLDER_COLOR),
+        order: normalizeSubjectOrder(meta?.order) ?? Number.MAX_SAFE_INTEGER,
         hasRecording,
         hasTranscript,
         hasTranslation,
@@ -2006,7 +2224,12 @@ export default function App() {
       });
     }
 
-    rows.sort((a, b) => b.updatedAt - a.updatedAt);
+    rows.sort((a, b) => {
+      if (a.order !== b.order) {
+        return a.order - b.order;
+      }
+      return b.updatedAt - a.updatedAt;
+    });
     setSubjects(rows);
 
     const desiredId = preferredId ?? selectedSubjectId;
@@ -2101,33 +2324,64 @@ export default function App() {
               <View style={styles.subjectList}>
                 {subjects.length === 0 ? <Text style={styles.helper}>저장된 폴더가 없습니다.</Text> : null}
                 {subjects.map((subject) => (
-                  <Pressable
-                    key={subject.id}
-                    style={[styles.subjectItem, { borderColor: subject.color }]}
-                    onPress={() => openDirectory(subject.id)}
-                  >
-                    <View style={styles.subjectHeaderRow}>
-                      <View style={[styles.folderIconBubble, { backgroundColor: subject.color }]}>
-                        <Text style={styles.folderIconText}>{subject.icon}</Text>
+                  <View key={subject.id} style={[styles.subjectItem, { borderColor: subject.color }]}>
+                    <Pressable style={styles.subjectOpenArea} onPress={() => openDirectory(subject.id)}>
+                      <View style={styles.subjectHeaderRow}>
+                        <View style={[styles.folderIconBubble, { backgroundColor: subject.color }]}>
+                          <Text style={styles.folderIconText}>{subject.icon}</Text>
+                        </View>
+                        <Text style={styles.subjectName}>{subject.name}</Text>
                       </View>
-                      <Text style={styles.subjectName}>{subject.name}</Text>
+                      <Text style={styles.subjectMeta}>
+                        {subject.hasRecording ? 'REC' : '-'} / {subject.hasTranscript ? 'TXT' : '-'} /{' '}
+                        {subject.hasTranslation ? 'TRN' : '-'} / {subject.hasSummary ? 'SUM' : '-'}
+                      </Text>
+                      {subject.previewFiles.length > 0 ? (
+                        <View style={styles.previewFileList}>
+                          {subject.previewFiles.map((fileName) => (
+                            <Text key={`${subject.id}-${fileName}`} style={styles.previewFileItem}>
+                              · {fileName}
+                            </Text>
+                          ))}
+                        </View>
+                      ) : (
+                        <Text style={styles.previewFileItem}>· 파일 없음</Text>
+                      )}
+                    </Pressable>
+                    <View style={styles.subjectActionRow}>
+                      <Pressable
+                        style={[styles.subjectActionButton, (isBusy || subjects[0]?.id === subject.id) && styles.disabledButton]}
+                        disabled={isBusy || subjects[0]?.id === subject.id}
+                        onPress={() => void moveSubject(subject.id, 'up')}
+                      >
+                        <Text style={styles.subjectActionText}>위로</Text>
+                      </Pressable>
+                      <Pressable
+                        style={[
+                          styles.subjectActionButton,
+                          (isBusy || subjects[subjects.length - 1]?.id === subject.id) && styles.disabledButton,
+                        ]}
+                        disabled={isBusy || subjects[subjects.length - 1]?.id === subject.id}
+                        onPress={() => void moveSubject(subject.id, 'down')}
+                      >
+                        <Text style={styles.subjectActionText}>아래로</Text>
+                      </Pressable>
+                      <Pressable
+                        style={[styles.subjectActionButton, isBusy && styles.disabledButton]}
+                        disabled={isBusy}
+                        onPress={() => openEditFolderModal(subject)}
+                      >
+                        <Text style={styles.subjectActionText}>수정</Text>
+                      </Pressable>
+                      <Pressable
+                        style={[styles.subjectActionButton, styles.subjectDeleteAction, isBusy && styles.disabledButton]}
+                        disabled={isBusy}
+                        onPress={() => void deleteSubject(subject)}
+                      >
+                        <Text style={styles.subjectDeleteActionText}>삭제</Text>
+                      </Pressable>
                     </View>
-                    <Text style={styles.subjectMeta}>
-                      {subject.hasRecording ? 'REC' : '-'} / {subject.hasTranscript ? 'TXT' : '-'} /{' '}
-                      {subject.hasTranslation ? 'TRN' : '-'} / {subject.hasSummary ? 'SUM' : '-'}
-                    </Text>
-                    {subject.previewFiles.length > 0 ? (
-                      <View style={styles.previewFileList}>
-                        {subject.previewFiles.map((fileName) => (
-                          <Text key={`${subject.id}-${fileName}`} style={styles.previewFileItem}>
-                            · {fileName}
-                          </Text>
-                        ))}
-                      </View>
-                    ) : (
-                      <Text style={styles.previewFileItem}>· 파일 없음</Text>
-                    )}
-                  </Pressable>
+                  </View>
                 ))}
               </View>
             </View>
@@ -2170,11 +2424,19 @@ export default function App() {
                 {isRecording ? '녹음 중입니다. 백그라운드에서도 계속 녹음됩니다.' : '시작 버튼으로 녹음을 시작하세요.'}
               </Text>
               {!isRecording ? (
-                <Pressable style={[styles.actionButton, isBusy && styles.disabledButton]} onPress={startRecording} disabled={isBusy}>
+                <Pressable
+                  style={[styles.actionButton, recordActionBusy && styles.disabledButton]}
+                  onPress={startRecording}
+                  disabled={recordActionBusy}
+                >
                   <Text style={styles.actionButtonText}>녹음 시작</Text>
                 </Pressable>
               ) : (
-                <Pressable style={[styles.deleteButton, isBusy && styles.disabledButton]} onPress={stopRecording} disabled={isBusy}>
+                <Pressable
+                  style={[styles.deleteButton, recordActionBusy && styles.disabledButton]}
+                  onPress={stopRecording}
+                  disabled={recordActionBusy}
+                >
                   <Text style={styles.deleteButtonText}>녹음 중지</Text>
                 </Pressable>
               )}
@@ -2346,10 +2608,7 @@ export default function App() {
                   style={styles.fabMenuItem}
                   onPress={() => {
                     setFabOpen(false);
-                    setNewFolderName('');
-                    setNewFolderIcon(DEFAULT_FOLDER_ICON);
-                    setNewFolderColor(DEFAULT_FOLDER_COLOR);
-                    setFolderModalVisible(true);
+                    openCreateFolderModal();
                   }}
                 >
                   <Text style={styles.fabMenuText}>새 폴더 추가</Text>
@@ -2552,10 +2811,15 @@ export default function App() {
         </View>
       </Modal>
 
-      <Modal visible={folderModalVisible} transparent animationType="fade" onRequestClose={() => setFolderModalVisible(false)}>
+      <Modal
+        visible={folderModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={closeFolderModal}
+      >
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>새 폴더 추가</Text>
+            <Text style={styles.modalTitle}>{folderModalMode === 'edit' ? '폴더 수정' : '새 폴더 추가'}</Text>
             <TextInput
               value={newFolderName}
               onChangeText={setNewFolderName}
@@ -2603,11 +2867,17 @@ export default function App() {
               ))}
             </View>
             <View style={styles.modalActions}>
-              <Pressable style={[styles.modalButton, styles.modalCancel]} onPress={() => setFolderModalVisible(false)}>
+              <Pressable
+                style={[styles.modalButton, styles.modalCancel]}
+                onPress={closeFolderModal}
+              >
                 <Text style={styles.modalButtonText}>취소</Text>
               </Pressable>
-              <Pressable style={[styles.modalButton, styles.modalSave]} onPress={() => void createSubject()}>
-                <Text style={styles.modalButtonText}>생성</Text>
+              <Pressable
+                style={[styles.modalButton, styles.modalSave]}
+                onPress={() => void (folderModalMode === 'edit' ? updateSubject() : createSubject())}
+              >
+                <Text style={styles.modalButtonText}>{folderModalMode === 'edit' ? '수정' : '생성'}</Text>
               </Pressable>
             </View>
           </View>
@@ -2943,8 +3213,40 @@ function normalizeFolderColor(value: string): string {
     : DEFAULT_FOLDER_COLOR;
 }
 
+function normalizeSubjectOrder(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return Math.floor(value);
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.floor(parsed);
+    }
+  }
+  return null;
+}
+
 function normalizeSubjectTag(value: string): SubjectTag {
   return value === 'general' || value === 'exam' ? value : 'major';
+}
+
+function removeDirectoryRecursive(directory: Directory) {
+  if (!directory.exists) {
+    return;
+  }
+  const entries = directory.list();
+  for (const entry of entries) {
+    if (entry instanceof Directory) {
+      removeDirectoryRecursive(entry);
+      continue;
+    }
+    if (entry instanceof File && entry.exists) {
+      entry.delete();
+    }
+  }
+  if (directory.exists) {
+    directory.delete();
+  }
 }
 
 function normalizeAuthUser(payload: any): AuthUserProfile | null {
@@ -3245,6 +3547,9 @@ const styles = StyleSheet.create({
     padding: 10,
     backgroundColor: '#F8FBFF',
   },
+  subjectOpenArea: {
+    borderRadius: 10,
+  },
   subjectItemActive: {
     borderColor: '#2563EB',
     backgroundColor: '#E9F2FF',
@@ -3281,6 +3586,34 @@ const styles = StyleSheet.create({
   previewFileItem: {
     color: '#475569',
     fontSize: 12,
+  },
+  subjectActionRow: {
+    marginTop: 9,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  subjectActionButton: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#93C5FD',
+    backgroundColor: '#EEF6FF',
+    paddingHorizontal: 11,
+    paddingVertical: 5,
+  },
+  subjectActionText: {
+    color: '#1E3A8A',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  subjectDeleteAction: {
+    borderColor: '#FECACA',
+    backgroundColor: '#FEE2E2',
+  },
+  subjectDeleteActionText: {
+    color: '#B91C1C',
+    fontSize: 12,
+    fontWeight: '800',
   },
   tagBadge: {
     alignSelf: 'flex-start',
