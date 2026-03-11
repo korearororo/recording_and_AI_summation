@@ -2506,6 +2506,15 @@ export default function App() {
         <ScrollView contentContainerStyle={styles.content}>
           <Text style={styles.title}>Campus Lecture Binder</Text>
           <Text style={styles.subtitle}>폴더 → 파일 → 전사/번역/요약 상세</Text>
+          <View style={styles.globalStatusCard}>
+            <Text style={styles.status}>상태: {statusMessage}</Text>
+            {pendingJobs.length > 0 ? (
+              <Text style={styles.pendingInfo}>
+                진행중 잡: {pendingJobs.map((job) => `${job.fileName} ${jobActionText(job.jobType)}`).join(', ')}
+              </Text>
+            ) : null}
+            {isBusy ? <ActivityIndicator color="#2563EB" style={styles.loader} /> : null}
+          </View>
 
           {screenMode === 'home' ? (
             <View style={styles.card}>
@@ -3904,6 +3913,14 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
     shadowOffset: { width: 0, height: 4 },
     elevation: 2,
+  },
+  globalStatusCard: {
+    backgroundColor: 'rgba(255,255,255,0.92)',
+    borderWidth: 1,
+    borderColor: 'rgba(37,99,235,0.2)',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
   },
   sectionTitle: {
     color: '#1D4ED8',
