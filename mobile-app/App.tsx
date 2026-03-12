@@ -48,6 +48,7 @@ type SubjectMeta = {
   icon?: string;
   color?: string;
   order?: number;
+  fileOrder?: string[];
   createdAt: number;
 };
 
@@ -447,6 +448,7 @@ export default function App() {
         icon: newFolderIcon || DEFAULT_FOLDER_ICON,
         color: normalizeFolderColor(newFolderColor),
         order: nextOrder,
+        fileOrder: [],
         createdAt: Date.now(),
       };
       writeText(paths.meta, JSON.stringify(meta, null, 2));
@@ -492,6 +494,7 @@ export default function App() {
         icon: newFolderIcon || DEFAULT_FOLDER_ICON,
         color: normalizeFolderColor(newFolderColor),
         order: normalizeSubjectOrder(currentMeta?.order) ?? Math.max(0, ...subjects.map((subject) => subject.order || 0)) + 1,
+        fileOrder: normalizeFileOrder(currentMeta?.fileOrder),
         createdAt: currentMeta?.createdAt ?? Date.now(),
       };
       writeText(paths.meta, JSON.stringify(meta, null, 2));
@@ -618,6 +621,47 @@ export default function App() {
     if (picked) {
       setScreenMode('detail');
       setStatusMessage(`녹음 파일 선택: ${picked.title}`);
+    }
+  };
+
+  const moveRecordingOrder = async (recordingId: string, direction: 'up' | 'down') => {
+    if (!selectedSubjectId) {
+      return;
+    }
+    const index = recordings.findIndex((item) => item.id === recordingId);
+    if (index < 0) {
+      return;
+    }
+    const targetIndex = direction === 'up' ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= recordings.length) {
+      setStatusMessage(direction === 'up' ? '이미 맨 위 파일입니다.' : '이미 맨 아래 파일입니다.');
+      return;
+    }
+
+    try {
+      const reordered = [...recordings];
+      const [moved] = reordered.splice(index, 1);
+      reordered.splice(targetIndex, 0, moved);
+      setRecordings(reordered);
+
+      const paths = getSubjectPaths(selectedSubjectId);
+      const currentMeta = await readMeta(paths.meta);
+      const fallbackSubject = subjects.find((subject) => subject.id === selectedSubjectId);
+      const nextMeta: SubjectMeta = {
+        id: selectedSubjectId,
+        name: currentMeta?.name ?? fallbackSubject?.name ?? selectedSubjectId,
+        tag: currentMeta?.tag ?? fallbackSubject?.tag ?? 'major',
+        icon: currentMeta?.icon ?? fallbackSubject?.icon ?? DEFAULT_FOLDER_ICON,
+        color: normalizeFolderColor(currentMeta?.color ?? fallbackSubject?.color ?? DEFAULT_FOLDER_COLOR),
+        order: normalizeSubjectOrder(currentMeta?.order ?? fallbackSubject?.order) ?? Number.MAX_SAFE_INTEGER,
+        fileOrder: reordered.map((item) => item.id),
+        createdAt: currentMeta?.createdAt ?? Date.now(),
+      };
+      writeText(paths.meta, JSON.stringify(nextMeta, null, 2));
+      await loadSubjects(selectedSubjectId);
+      setStatusMessage(`파일 순서 변경 완료: ${moved.title}`);
+    } catch (error) {
+      setStatusMessage(`파일 순서 변경 실패: ${formatError(error)}`);
     }
   };
 
@@ -2702,7 +2746,8 @@ export default function App() {
       const id = entry.name;
       const paths = getSubjectPaths(id);
       const meta = await readMeta(paths.meta);
-      const recordings = listRecordingItems(paths);
+      const orderedRecordings = applyRecordingOrder(listRecordingItems(paths), meta?.fileOrder);
+      const recordings = orderedRecordings.items;
 
       const updatedAt =
         Math.max(recordings[0]?.updatedAt ?? 0, meta?.createdAt ?? 0, paths.meta.modificationTime ?? 0) || 0;
@@ -2750,8 +2795,25 @@ export default function App() {
 
   const loadSubjectFiles = async (subjectId: string, preferredRecordingId?: string | null) => {
     const paths = getSubjectPaths(subjectId);
-    const items = listRecordingItems(paths);
+    const meta = await readMeta(paths.meta);
+    const currentOrder = normalizeFileOrder(meta?.fileOrder);
+    const orderedResult = applyRecordingOrder(listRecordingItems(paths), currentOrder);
+    const items = orderedResult.items;
     setRecordings(items);
+
+    if (meta && !isSameStringArray(currentOrder, orderedResult.order)) {
+      writeText(
+        paths.meta,
+        JSON.stringify(
+          {
+            ...meta,
+            fileOrder: orderedResult.order,
+          },
+          null,
+          2,
+        ),
+      );
+    }
 
     if (items.length === 0) {
       setSelectedRecordingId(null);
@@ -2949,7 +3011,7 @@ export default function App() {
               <Text style={styles.helper}>파일 박스를 누르면 상세 창이 열립니다.</Text>
               <View style={styles.recordingList}>
                 {recordings.length === 0 ? <Text style={styles.helper}>저장된 녹음 파일이 없습니다.</Text> : null}
-                {recordings.map((item) => (
+                {recordings.map((item, index) => (
                   <View key={item.id} style={styles.recordingItem}>
                     <Pressable style={styles.recordingMainArea} onPress={() => void selectRecording(item.id)}>
                       <Text style={styles.recordingTitle}>{item.title}</Text>
@@ -2959,6 +3021,20 @@ export default function App() {
                       </Text>
                     </Pressable>
                     <View style={styles.recordingActionRow}>
+                      <Pressable
+                        style={[styles.recordingMoveButton, (isBusy || index === 0) && styles.disabledButton]}
+                        onPress={() => void moveRecordingOrder(item.id, 'up')}
+                        disabled={isBusy || index === 0}
+                      >
+                        <Text style={styles.recordingMoveButtonText}>위</Text>
+                      </Pressable>
+                      <Pressable
+                        style={[styles.recordingMoveButton, (isBusy || index === recordings.length - 1) && styles.disabledButton]}
+                        onPress={() => void moveRecordingOrder(item.id, 'down')}
+                        disabled={isBusy || index === recordings.length - 1}
+                      >
+                        <Text style={styles.recordingMoveButtonText}>아래</Text>
+                      </Pressable>
                       <Pressable
                         style={[styles.recordingMoveButton, isBusy && styles.disabledButton]}
                         onPress={() => openMoveRecordingModal(item)}
@@ -3825,6 +3901,73 @@ function normalizeSubjectOrder(value: unknown): number | null {
   return null;
 }
 
+function normalizeFileOrder(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const rows: string[] = [];
+  for (const item of value) {
+    if (typeof item !== 'string') {
+      continue;
+    }
+    const name = item.trim();
+    if (!name || seen.has(name)) {
+      continue;
+    }
+    seen.add(name);
+    rows.push(name);
+  }
+  return rows;
+}
+
+function applyRecordingOrder(items: RecordingItem[], fileOrder: unknown): { items: RecordingItem[]; order: string[] } {
+  if (items.length === 0) {
+    return { items: [], order: [] };
+  }
+
+  const order = normalizeFileOrder(fileOrder);
+  if (order.length === 0) {
+    const fallbackOrder = items.map((item) => item.id);
+    return { items: items.slice(), order: fallbackOrder };
+  }
+
+  const byId = new Map<string, RecordingItem>();
+  for (const item of items) {
+    byId.set(item.id, item);
+  }
+
+  const ordered: RecordingItem[] = [];
+  const seen = new Set<string>();
+  for (const id of order) {
+    const found = byId.get(id);
+    if (!found) {
+      continue;
+    }
+    ordered.push(found);
+    seen.add(id);
+  }
+  for (const item of items) {
+    if (seen.has(item.id)) {
+      continue;
+    }
+    ordered.push(item);
+  }
+  return { items: ordered, order: ordered.map((item) => item.id) };
+}
+
+function isSameStringArray(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function normalizeSubjectTag(value: string): SubjectTag {
   return value === 'general' || value === 'exam' ? value : 'major';
 }
@@ -4668,6 +4811,7 @@ const styles = StyleSheet.create({
   recordingActionRow: {
     flexDirection: 'row',
     justifyContent: 'flex-end',
+    gap: 6,
   },
   recordingMoveButton: {
     borderRadius: 999,
