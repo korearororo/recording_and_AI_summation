@@ -1302,6 +1302,7 @@ def sync_subject_files_to_library(
     current_user: dict[str, str] = Depends(_require_user),
 ) -> LibrarySyncResponse:
     saved_files: list[str] = []
+    temp_upload_paths: list[str] = []
     entry_key = _entry_key_from_names(recording_name, transcript_name, translation_name, summary_name)
 
     try:
@@ -1310,42 +1311,50 @@ def sync_subject_files_to_library(
             uploads: list[UploadPayload] = []
             if recording is not None:
                 file_name = _safe_file_name(recording_name or recording.filename or "recording.m4a", "recording.m4a")
+                temp_path = _save_upload_to_temp(recording)
+                temp_upload_paths.append(temp_path)
                 uploads.append(
                     UploadPayload(
                         kind="recording",
                         file_name=file_name,
-                        content=recording.file.read(),
                         content_type=recording.content_type or "audio/m4a",
+                        source_path=temp_path,
                     )
                 )
             if transcript is not None:
                 file_name = _safe_file_name(transcript_name or transcript.filename or "transcript.txt", "transcript.txt")
+                temp_path = _save_upload_to_temp(transcript)
+                temp_upload_paths.append(temp_path)
                 uploads.append(
                     UploadPayload(
                         kind="transcript",
                         file_name=file_name,
-                        content=transcript.file.read(),
                         content_type=transcript.content_type or "text/plain",
+                        source_path=temp_path,
                     )
                 )
             if translation is not None:
                 file_name = _safe_file_name(translation_name or translation.filename or "translation.txt", "translation.txt")
+                temp_path = _save_upload_to_temp(translation)
+                temp_upload_paths.append(temp_path)
                 uploads.append(
                     UploadPayload(
                         kind="translation",
                         file_name=file_name,
-                        content=translation.file.read(),
                         content_type=translation.content_type or "text/plain",
+                        source_path=temp_path,
                     )
                 )
             if summary is not None:
                 file_name = _safe_file_name(summary_name or summary.filename or "summary.txt", "summary.txt")
+                temp_path = _save_upload_to_temp(summary)
+                temp_upload_paths.append(temp_path)
                 uploads.append(
                     UploadPayload(
                         kind="summary",
                         file_name=file_name,
-                        content=summary.file.read(),
                         content_type=summary.content_type or "text/plain",
+                        source_path=temp_path,
                     )
                 )
 
@@ -1424,6 +1433,12 @@ def sync_subject_files_to_library(
             translation.file.close()
         if summary is not None:
             summary.file.close()
+        for temp_path in temp_upload_paths:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
 
 
 @app.get("/api/library")

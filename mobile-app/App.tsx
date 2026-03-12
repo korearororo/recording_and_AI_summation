@@ -146,7 +146,7 @@ const FOLDER_ICON_OPTIONS = ['📁', '📘', '📗', '📕', '🧪', '💻', '�
 const FOLDER_COLOR_OPTIONS = ['#DBEAFE', '#E9D5FF', '#FCE7F3', '#DCFCE7', '#FEF3C7', '#E0F2FE', '#F1F5F9'];
 const DEFAULT_FOLDER_ICON = '📁';
 const DEFAULT_FOLDER_COLOR = '#DBEAFE';
-const CLOUD_UPLOAD_CONCURRENCY = 3;
+const CLOUD_UPLOAD_CONCURRENCY = 1;
 const CLOUD_RESTORE_CONCURRENCY = 2;
 const SOCIAL_PROVIDER_LABELS: Record<SocialProvider, string> = {
   kakao: '카카오',
@@ -1921,7 +1921,8 @@ export default function App() {
     }
 
     let lastError: unknown = null;
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const maxAttempts = 5;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         const response = await fetch(`${apiBaseUrl}/api/library/sync`, {
           method: 'POST',
@@ -1935,13 +1936,15 @@ export default function App() {
         return payload;
       } catch (error) {
         lastError = error;
-        if (attempt < 3) {
-          await delay(1000 * attempt);
+        if (attempt < maxAttempts) {
+          const msg = formatError(error);
+          const transient = /\((502|503|504)\b/.test(msg) || /\b(502|503|504)\b/.test(msg);
+          await delay(transient ? 3000 * attempt : 1000 * attempt);
         }
       }
     }
 
-    throw new Error(`서버 동기화 실패(재시도 3회): ${formatError(lastError)}`);
+    throw new Error(`서버 동기화 실패(재시도 ${maxAttempts}회): ${formatError(lastError)}`);
   };
 
   const uploadAllFoldersToCloud = async () => {

@@ -12,7 +12,7 @@ from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -22,8 +22,9 @@ DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 class UploadPayload:
     kind: str
     file_name: str
-    content: bytes
     content_type: str
+    content: bytes | None = None
+    source_path: str = ""
 
 
 class GoogleDriveLibraryStore:
@@ -114,6 +115,7 @@ class GoogleDriveLibraryStore:
                 file_name=stored_name,
                 content=payload.content,
                 content_type=payload.content_type,
+                source_path=payload.source_path,
             )
             saved_files.append(f"entries/{resolved_entry_key}/{payload.kind}/{payload.file_name}")
 
@@ -488,12 +490,28 @@ class GoogleDriveLibraryStore:
         items = self._list_files(query, fields="files(id,name,mimeType,md5Checksum,size,modifiedTime)")
         return items[0] if items else None
 
-    def _upload_or_replace_file(self, parent_id: str, file_name: str, content: bytes, content_type: str) -> str:
+    def _upload_or_replace_file(
+        self,
+        parent_id: str,
+        file_name: str,
+        content: bytes | None,
+        content_type: str,
+        source_path: str = "",
+    ) -> str:
         existing = self._find_file(parent_id, file_name)
-        content_md5 = hashlib.md5(content).hexdigest()
+        if source_path:
+            content_md5 = self._file_md5(Path(source_path))
+            media = MediaFileUpload(source_path, mimetype=content_type or "application/octet-stream", resumable=True)
+        else:
+            content_bytes = content or b""
+            content_md5 = hashlib.md5(content_bytes).hexdigest()
+            media = MediaIoBaseUpload(
+                io.BytesIO(content_bytes),
+                mimetype=content_type or "application/octet-stream",
+                resumable=False,
+            )
         if existing is not None and str(existing.get("md5Checksum") or "").lower() == content_md5.lower():
             return str(existing["id"])
-        media = MediaIoBaseUpload(io.BytesIO(content), mimetype=content_type or "application/octet-stream", resumable=False)
         if existing is not None:
             updated = (
                 self._drive.files()
@@ -514,6 +532,16 @@ class GoogleDriveLibraryStore:
             .execute()
         )
         return str(created["id"])
+
+    def _file_md5(self, file_path: Path) -> str:
+        digest = hashlib.md5()
+        with file_path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _download_file(self, file_id: str) -> bytes:
         request = self._drive.files().get_media(fileId=file_id, supportsAllDrives=True)
