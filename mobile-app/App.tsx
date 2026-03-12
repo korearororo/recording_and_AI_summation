@@ -243,6 +243,7 @@ export default function App() {
   const [isBusy, setIsBusy] = useState(false);
   const [recordActionBusy, setRecordActionBusy] = useState(false);
   const [cloudSyncBusy, setCloudSyncBusy] = useState<'upload' | 'restore' | null>(null);
+  const [cloudRootDir, setCloudRootDir] = useState('');
   const [libraryPath, setLibraryPath] = useState('');
   const [librarySavedFiles, setLibrarySavedFiles] = useState<string[]>([]);
   const [authModalVisible, setAuthModalVisible] = useState(false);
@@ -2090,6 +2091,8 @@ export default function App() {
       }
 
       const cloudSubjects = normalizeCloudSubjectSnapshots(cloudListPayload?.subjects);
+      const cloudRootPath = typeof cloudListPayload?.root_dir === 'string' ? cloudListPayload.root_dir : '';
+      setCloudRootDir(cloudRootPath);
       const cloudSubjectById: Record<string, CloudSubjectSnapshot> = {};
       for (const subject of cloudSubjects) {
         cloudSubjectById[subject.subjectId] = subject;
@@ -2110,6 +2113,7 @@ export default function App() {
       let syncedMetaCount = 0;
       let repairedParts = 0;
       let cleanupRemoved = 0;
+      let missingAfterVerify = 0;
       const localPartsForVerification: Array<{
         subjectId: string;
         subjectName: string;
@@ -2316,6 +2320,34 @@ export default function App() {
             setStatusMessage(`서버 업로드 보정 중... ${done}/${total}`);
           });
         }
+
+        // Final verify pass to detect any remaining missing entries.
+        const finalVerifyResponse = await fetch(`${apiBaseUrl}/api/library`, {
+          headers: getAuthHeaders(),
+        });
+        const finalVerifyPayload = await readJsonSafely(finalVerifyResponse);
+        if (finalVerifyResponse.ok) {
+          const finalSubjects = normalizeCloudSubjectSnapshots(finalVerifyPayload?.subjects);
+          const finalLookup = buildCloudMetaLookup(finalSubjects);
+          const seenKeys = new Set<string>();
+          for (const part of localPartsForVerification) {
+            const key = cloudLookupKey(part.subjectId, part.kind, part.name);
+            if (seenKeys.has(key)) {
+              continue;
+            }
+            seenKeys.add(key);
+            const remote = finalLookup[key];
+            const localMd5 = (part.md5 || '').trim().toLowerCase();
+            const remoteMd5 = (remote?.md5 || '').trim().toLowerCase();
+            if (!remote) {
+              missingAfterVerify += 1;
+              continue;
+            }
+            if (localMd5 && remoteMd5 && localMd5 !== remoteMd5) {
+              missingAfterVerify += 1;
+            }
+          }
+        }
       }
       await saveLocalMd5Cache(md5Cache);
 
@@ -2333,7 +2365,9 @@ export default function App() {
       }
 
       setStatusMessage(
-        `서버 업로드 완료 (세트 ${uploadUnits}개, 파일 ${uploadedParts}/${checkedParts}개, 스킵 ${skippedParts}개, 보정 ${repairedParts}개, 메타 ${syncedMetaCount}개, 빈폴더 정리 ${cleanupRemoved}개)`,
+        `서버 업로드 완료 (세트 ${uploadUnits}개, 파일 ${uploadedParts}/${checkedParts}개, 스킵 ${skippedParts}개, 보정 ${repairedParts}개, 검증누락 ${missingAfterVerify}개, 메타 ${syncedMetaCount}개, 빈폴더 정리 ${cleanupRemoved}개)${
+          cloudRootPath ? ` / 저장위치: ${cloudRootPath}` : ''
+        }`,
       );
     } catch (error) {
       setStatusMessage(`서버 업로드 실패: ${formatError(error)}`);
@@ -2364,6 +2398,8 @@ export default function App() {
       }
 
       const cloudSubjects = normalizeCloudSubjectSnapshots(payload?.subjects);
+      const cloudRootPath = typeof payload?.root_dir === 'string' ? payload.root_dir : '';
+      setCloudRootDir(cloudRootPath);
       if (cloudSubjects.length === 0) {
         setStatusMessage('서버에 저장된 폴더가 없습니다.');
         return;
@@ -2811,6 +2847,24 @@ export default function App() {
                   </View>
                 </Pressable>
               </View>
+              {cloudRootDir ? (
+                <View style={styles.cloudLocationRow}>
+                  <Text style={styles.cloudLocationText}>클라우드 위치: {cloudRootDir}</Text>
+                  {toDriveWebUrl(cloudRootDir) ? (
+                    <Pressable
+                      style={styles.cloudLocationButton}
+                      onPress={() => {
+                        const target = toDriveWebUrl(cloudRootDir);
+                        if (target) {
+                          void Linking.openURL(target);
+                        }
+                      }}
+                    >
+                      <Text style={styles.cloudLocationButtonText}>드라이브 열기</Text>
+                    </Pressable>
+                  ) : null}
+                </View>
+              ) : null}
               <Pressable
                 style={[styles.cloudArchiveButton, isBusy && styles.disabledButton]}
                 onPress={archiveAndClearCloudLibrary}
@@ -4135,6 +4189,21 @@ function compactRequestUrl(value: string): string {
   }
 }
 
+function toDriveWebUrl(value: string): string {
+  const raw = value.trim();
+  if (!raw) {
+    return '';
+  }
+  const marker = 'drive://folder/';
+  if (raw.startsWith(marker)) {
+    const folderId = raw.slice(marker.length).trim();
+    if (folderId) {
+      return `https://drive.google.com/drive/folders/${folderId}`;
+    }
+  }
+  return '';
+}
+
 function getApiErrorMessage(payload: any, response: Response, fallback: string, requestUrl?: string): string {
   const target = compactRequestUrl(requestUrl || response.url || '');
   const withTarget = (message: string) => (target ? `${message} (${response.status} @ ${target})` : `${message} (${response.status})`);
@@ -4365,6 +4434,34 @@ const styles = StyleSheet.create({
   },
   cloudArchiveButtonText: {
     color: '#9F1239',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  cloudLocationRow: {
+    marginTop: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    backgroundColor: '#EFF6FF',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    gap: 6,
+  },
+  cloudLocationText: {
+    color: '#1E3A8A',
+    fontSize: 12,
+  },
+  cloudLocationButton: {
+    alignSelf: 'flex-start',
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#93C5FD',
+    backgroundColor: '#DBEAFE',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  cloudLocationButtonText: {
+    color: '#1E3A8A',
     fontSize: 12,
     fontWeight: '800',
   },
