@@ -15,7 +15,7 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
@@ -513,6 +513,109 @@ def _archive_local_user_library(settings: Settings, user_id: str) -> dict[str, o
         moved += 1
 
     return {"archive_dir": str(archive_dir.resolve()), "moved_items": moved}
+
+
+def _find_local_entry_dir_by_recording_name(subject_dir: Path, recording_name: str) -> Path | None:
+    entries_dir = subject_dir / "entries"
+    if not entries_dir.exists():
+        return None
+
+    safe_recording = _safe_file_name(recording_name, "recording.m4a")
+    entry_key = _entry_key_from_names(safe_recording)
+    direct = entries_dir / entry_key
+    if direct.is_dir():
+        return direct
+
+    desired_prefixed = _entry_file_name("recording", safe_recording).lower()
+    for entry_dir in entries_dir.iterdir():
+        if not entry_dir.is_dir():
+            continue
+        candidate = entry_dir / _entry_file_name("recording", safe_recording)
+        if candidate.exists():
+            return entry_dir
+        for child in entry_dir.iterdir():
+            if child.is_file() and child.name.lower() == desired_prefixed:
+                return entry_dir
+    return None
+
+
+def _cleanup_local_empty_folders(settings: Settings, user_id: str) -> dict[str, object]:
+    root = _resolve_library_root(settings, user_id)
+    removed = 0
+    if not root.exists():
+        return {"removed_folders": 0}
+
+    for subject_dir in root.iterdir():
+        if not subject_dir.is_dir():
+            continue
+
+        entries_dir = subject_dir / "entries"
+        if entries_dir.exists() and entries_dir.is_dir():
+            for entry_dir in list(entries_dir.iterdir()):
+                if not entry_dir.is_dir():
+                    continue
+                has_file = any(path.is_file() for path in entry_dir.rglob("*"))
+                if has_file:
+                    continue
+                shutil.rmtree(entry_dir, ignore_errors=True)
+                removed += 1
+            if not any(entries_dir.iterdir()):
+                entries_dir.rmdir()
+                removed += 1
+
+        for legacy_name in ("recordings", "transcripts", "translations", "summaries"):
+            legacy_dir = subject_dir / legacy_name
+            if legacy_dir.exists() and legacy_dir.is_dir() and not any(legacy_dir.iterdir()):
+                legacy_dir.rmdir()
+                removed += 1
+
+    return {"removed_folders": removed}
+
+
+def _move_local_entry_between_subjects(
+    settings: Settings,
+    user_id: str,
+    from_subject_id: str,
+    to_subject_id: str,
+    to_subject_name: str,
+    recording_name: str,
+) -> dict[str, object]:
+    root = _resolve_library_root(settings, user_id)
+    source_subject_dir = _find_subject_dir(root, from_subject_id)
+    if source_subject_dir is None:
+        raise FileNotFoundError("source subject not found")
+
+    target_subject_dir = _subject_library_dir(settings, to_subject_id, to_subject_name or to_subject_id, user_id)
+    source_entry_dir = _find_local_entry_dir_by_recording_name(source_subject_dir, recording_name)
+    if source_entry_dir is None:
+        raise FileNotFoundError("entry folder not found")
+
+    target_entries_dir = _subject_entries_dir(target_subject_dir)
+    target_entry_dir = target_entries_dir / source_entry_dir.name
+    moved_items = 0
+
+    if target_entry_dir.exists():
+        for child in source_entry_dir.iterdir():
+            target_child = target_entry_dir / child.name
+            if target_child.exists():
+                if target_child.is_dir():
+                    shutil.rmtree(target_child, ignore_errors=True)
+                else:
+                    target_child.unlink(missing_ok=True)
+            shutil.move(str(child), str(target_child))
+            moved_items += 1
+        if source_entry_dir.exists() and not any(source_entry_dir.iterdir()):
+            source_entry_dir.rmdir()
+    else:
+        shutil.move(str(source_entry_dir), str(target_entry_dir))
+        moved_items = sum(1 for path in target_entry_dir.rglob("*") if path.is_file())
+
+    cleanup = _cleanup_local_empty_folders(settings, user_id)
+    return {
+        "entry_key": target_entry_dir.name,
+        "moved_items": moved_items,
+        "cleanup_removed_folders": int(cleanup.get("removed_folders") or 0),
+    }
 
 
 def _copy_upload_to(upload: UploadFile, target_path: Path) -> None:
@@ -1504,6 +1607,81 @@ def archive_and_clear_library(
         return _archive_local_user_library(settings, current_user["id"])
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Library archive failed: {exc}") from exc
+
+
+@app.post("/api/library/move")
+def move_library_entry(
+    from_subject_id: str = Body(...),
+    from_subject_name: str = Body(default=""),
+    to_subject_id: str = Body(...),
+    to_subject_name: str = Body(default=""),
+    recording_name: str = Body(...),
+    settings: Settings = Depends(get_settings),
+    current_user: dict[str, str] = Depends(_require_user),
+) -> dict[str, object]:
+    source_id = from_subject_id.strip()
+    target_id = to_subject_id.strip()
+    if not source_id or not target_id:
+        raise HTTPException(status_code=400, detail="from_subject_id and to_subject_id are required")
+    if source_id == target_id:
+        raise HTTPException(status_code=400, detail="source and target folder cannot be the same")
+    record_name = _safe_file_name(recording_name, "recording.m4a")
+
+    try:
+        if _use_google_drive_library(settings):
+            drive_store = _get_google_drive_store(settings)
+            result = drive_store.move_subject_entry(
+                user_id=current_user["id"],
+                from_subject_id=source_id,
+                to_subject_id=target_id,
+                to_subject_name=to_subject_name.strip() or target_id,
+                recording_name=record_name,
+            )
+            # Ensure destination metadata exists/updated after move.
+            drive_store.upsert_subject_meta(
+                user_id=current_user["id"],
+                subject_id=target_id,
+                subject_name=to_subject_name.strip() or target_id,
+                meta={
+                    "id": target_id,
+                    "name": to_subject_name.strip() or target_id,
+                    "tag": "",
+                    "icon": "",
+                    "color": "",
+                    "order": "",
+                    "updated_at": _now_ts(),
+                },
+            )
+            return result
+
+        return _move_local_entry_between_subjects(
+            settings=settings,
+            user_id=current_user["id"],
+            from_subject_id=source_id,
+            to_subject_id=target_id,
+            to_subject_name=to_subject_name.strip() or target_id,
+            recording_name=record_name,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Library move failed: {exc}") from exc
+
+
+@app.post("/api/library/cleanup-empty")
+def cleanup_library_empty_folders(
+    settings: Settings = Depends(get_settings),
+    current_user: dict[str, str] = Depends(_require_user),
+) -> dict[str, object]:
+    try:
+        if _use_google_drive_library(settings):
+            drive_store = _get_google_drive_store(settings)
+            return drive_store.cleanup_empty_user_folders(current_user["id"])
+        return _cleanup_local_empty_folders(settings, current_user["id"])
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Library cleanup failed: {exc}") from exc
 
 
 @app.get("/api/library/file")

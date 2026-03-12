@@ -129,6 +129,18 @@ class GoogleDriveLibraryStore:
 
         return f"drive://folder/{subject_folder_id}", saved_files
 
+    def upsert_subject_meta(self, user_id: str, subject_id: str, subject_name: str, meta: dict[str, object]) -> str:
+        user_folder_id = self._find_or_create_folder(self._root_folder_id, f"user_{self._safe_segment(user_id)}")
+        subject_folder_id = self._find_or_create_subject_folder(user_folder_id, subject_id, subject_name)
+        meta_bytes = json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
+        self._upload_or_replace_file(
+            parent_id=subject_folder_id,
+            file_name="meta.json",
+            content=meta_bytes,
+            content_type="application/json",
+        )
+        return f"drive://folder/{subject_folder_id}"
+
     def list_subjects(self, user_id: str) -> dict[str, object]:
         user_folder_name = f"user_{self._safe_segment(user_id)}"
         user_folder = self._find_folder(self._root_folder_id, user_folder_name)
@@ -301,6 +313,104 @@ class GoogleDriveLibraryStore:
 
         return {"archive_dir": f"drive://folder/{archive_id}", "moved_items": moved}
 
+    def move_subject_entry(
+        self,
+        user_id: str,
+        from_subject_id: str,
+        to_subject_id: str,
+        to_subject_name: str,
+        recording_name: str,
+    ) -> dict[str, object]:
+        user_folder_name = f"user_{self._safe_segment(user_id)}"
+        user_folder = self._find_folder(self._root_folder_id, user_folder_name)
+        if user_folder is None:
+            raise FileNotFoundError("user folder not found")
+        user_folder_id = str(user_folder["id"])
+
+        source_subject = self._find_subject_folder(user_folder_id, from_subject_id)
+        if source_subject is None:
+            raise FileNotFoundError("source subject not found")
+        source_subject_id = str(source_subject["id"])
+
+        target_subject_id = self._find_or_create_subject_folder(user_folder_id, to_subject_id, to_subject_name or to_subject_id)
+
+        entry_key = self._safe_segment(Path(recording_name or "").stem or "")
+        source_entry = self._find_folder(source_subject_id, entry_key) if entry_key else None
+        if source_entry is None:
+            source_entry = self._find_entry_folder_by_recording_name(source_subject_id, recording_name)
+        if source_entry is None:
+            raise FileNotFoundError("entry folder not found")
+
+        source_entry_id = str(source_entry["id"])
+        source_entry_name = str(source_entry.get("name") or entry_key or "entry")
+        moved_items = 0
+
+        existing_target_entry = self._find_folder(target_subject_id, source_entry_name)
+        if existing_target_entry is None:
+            self._drive.files().update(
+                fileId=source_entry_id,
+                addParents=target_subject_id,
+                removeParents=source_subject_id,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            moved_items = 1
+        else:
+            target_entry_id = str(existing_target_entry["id"])
+            items = self._list_files(
+                query=f"'{self._escape_query(source_entry_id)}' in parents and trashed = false",
+                fields="files(id,name,mimeType,parents)",
+            )
+            for item in items:
+                file_id = str(item.get("id") or "")
+                if not file_id:
+                    continue
+                self._drive.files().update(
+                    fileId=file_id,
+                    addParents=target_entry_id,
+                    removeParents=source_entry_id,
+                    fields="id",
+                    supportsAllDrives=True,
+                ).execute()
+                moved_items += 1
+            self._delete_folder_if_empty(source_entry_id)
+
+        cleanup = self.cleanup_empty_user_folders(user_id)
+        return {
+            "entry_key": source_entry_name,
+            "moved_items": moved_items,
+            "cleanup_removed_folders": int(cleanup.get("removed_folders") or 0),
+        }
+
+    def cleanup_empty_user_folders(self, user_id: str) -> dict[str, object]:
+        user_folder_name = f"user_{self._safe_segment(user_id)}"
+        user_folder = self._find_folder(self._root_folder_id, user_folder_name)
+        if user_folder is None:
+            return {"removed_folders": 0}
+
+        removed = 0
+        user_folder_id = str(user_folder["id"])
+        subject_folders = self._list_child_folders(user_folder_id)
+        for subject in subject_folders:
+            subject_folder_id = str(subject.get("id") or "")
+            if not subject_folder_id:
+                continue
+            for child in self._list_child_folders(subject_folder_id):
+                child_id = str(child.get("id") or "")
+                if not child_id:
+                    continue
+                if self._folder_has_children(child_id):
+                    continue
+                self._delete_folder(child_id)
+                removed += 1
+
+            # If a subject folder became completely empty, remove it too.
+            if not self._folder_has_children(subject_folder_id):
+                self._delete_folder(subject_folder_id)
+                removed += 1
+
+        return {"removed_folders": removed}
+
     def _load_service_account_info(self, raw: str) -> dict[str, object]:
         value = raw.strip()
         if not value:
@@ -398,6 +508,28 @@ class GoogleDriveLibraryStore:
             return str(existing["id"])
         folder_name = f"{self._safe_segment(subject_name or subject_id)}__{self._safe_segment(subject_id)}"
         return self._find_or_create_folder(user_folder_id, folder_name)
+
+    def _find_entry_folder_by_recording_name(self, subject_folder_id: str, recording_name: str) -> dict[str, object] | None:
+        safe_recording = (recording_name or "").strip()
+        if not safe_recording:
+            return None
+        desired = f"recording__{safe_recording}".lower()
+        for entry_folder in self._list_child_folders(subject_folder_id):
+            entry_name = str(entry_folder.get("name") or "")
+            if entry_name in {"recordings", "transcripts", "translations", "summaries"}:
+                continue
+            files = self._list_files(
+                query=(
+                    f"'{self._escape_query(str(entry_folder['id']))}' in parents and trashed = false "
+                    f"and mimeType != '{FOLDER_MIME}'"
+                ),
+                fields="files(id,name)",
+            )
+            for file_item in files:
+                raw_name = str(file_item.get("name") or "").strip().lower()
+                if raw_name == desired:
+                    return entry_folder
+        return None
 
     def _find_file_in_entry_folders(self, subject_folder_id: str, stored_name: str) -> dict[str, object] | None:
         for entry_folder in self._list_child_folders(subject_folder_id):
@@ -560,6 +692,21 @@ class GoogleDriveLibraryStore:
             done = False
             while not done:
                 _, done = downloader.next_chunk()
+
+    def _folder_has_children(self, folder_id: str) -> bool:
+        items = self._list_files(
+            query=f"'{self._escape_query(folder_id)}' in parents and trashed = false",
+            fields="files(id)",
+        )
+        return len(items) > 0
+
+    def _delete_folder_if_empty(self, folder_id: str) -> None:
+        if self._folder_has_children(folder_id):
+            return
+        self._delete_folder(folder_id)
+
+    def _delete_folder(self, folder_id: str) -> None:
+        self._drive.files().delete(fileId=folder_id, supportsAllDrives=True).execute()
 
     def _read_meta_json(self, subject_folder_id: str) -> dict[str, object]:
         meta_file = self._find_file(subject_folder_id, "meta.json")

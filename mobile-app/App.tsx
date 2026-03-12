@@ -207,6 +207,10 @@ export default function App() {
   const [uploadName, setUploadName] = useState('');
   const [uploadVideoLink, setUploadVideoLink] = useState('');
   const [uploadTargetFolderId, setUploadTargetFolderId] = useState<string | null>(null);
+  const [moveModalVisible, setMoveModalVisible] = useState(false);
+  const [moveSourceFolderId, setMoveSourceFolderId] = useState<string | null>(null);
+  const [moveTargetFolderId, setMoveTargetFolderId] = useState<string | null>(null);
+  const [moveRecordingId, setMoveRecordingId] = useState<string | null>(null);
   const [recordingDraftUri, setRecordingDraftUri] = useState<string | null>(null);
   const [recordingSaveVisible, setRecordingSaveVisible] = useState(false);
   const [recordingSaveName, setRecordingSaveName] = useState('');
@@ -362,6 +366,10 @@ export default function App() {
         setUploadModalVisible(false);
         return true;
       }
+      if (moveModalVisible) {
+        setMoveModalVisible(false);
+        return true;
+      }
       if (fabOpen) {
         setFabOpen(false);
         return true;
@@ -385,6 +393,7 @@ export default function App() {
     editorVisible,
     fabOpen,
     folderModalVisible,
+    moveModalVisible,
     recordingSaveVisible,
     renameVisible,
     screenMode,
@@ -608,6 +617,118 @@ export default function App() {
     if (picked) {
       setScreenMode('detail');
       setStatusMessage(`녹음 파일 선택: ${picked.title}`);
+    }
+  };
+
+  const openMoveRecordingModal = (item: RecordingItem) => {
+    if (!selectedSubjectId) {
+      setStatusMessage('폴더를 먼저 선택해주세요.');
+      return;
+    }
+    const candidates = subjects.filter((subject) => subject.id !== selectedSubjectId);
+    if (candidates.length === 0) {
+      setStatusMessage('이동할 다른 폴더가 없습니다.');
+      return;
+    }
+    setMoveSourceFolderId(selectedSubjectId);
+    setMoveRecordingId(item.id);
+    setMoveTargetFolderId(candidates[0].id);
+    setMoveModalVisible(true);
+  };
+
+  const closeMoveModal = () => {
+    setMoveModalVisible(false);
+    setMoveSourceFolderId(null);
+    setMoveRecordingId(null);
+    setMoveTargetFolderId(null);
+  };
+
+  const moveFileReplace = (source: File, destination: File) => {
+    if (!source.exists) {
+      return;
+    }
+    if (destination.exists) {
+      destination.delete();
+    }
+    source.move(destination);
+  };
+
+  const moveRecordingToFolder = async () => {
+    const sourceFolderId = moveSourceFolderId;
+    const targetFolderId = moveTargetFolderId;
+    const targetRecordingId = moveRecordingId;
+    if (!sourceFolderId || !targetFolderId || !targetRecordingId) {
+      setStatusMessage('이동할 파일/대상 폴더를 선택해주세요.');
+      return;
+    }
+    if (sourceFolderId === targetFolderId) {
+      setStatusMessage('같은 폴더로는 이동할 수 없습니다.');
+      return;
+    }
+
+    try {
+      setIsBusy(true);
+      const sourcePaths = getSubjectPaths(sourceFolderId);
+      const targetPaths = getSubjectPaths(targetFolderId);
+      ensureRecordingDirs(sourcePaths);
+      ensureRecordingDirs(targetPaths);
+      const sourceItems = listRecordingItems(sourcePaths);
+      const item = sourceItems.find((row) => row.id === targetRecordingId);
+      if (!item || !item.recordingFile.exists) {
+        throw new Error('이동할 녹음 파일을 찾지 못했습니다.');
+      }
+
+      const recordingName = item.recordingFile.name || item.title;
+      const sourceBase = stripAudioExtension(recordingName);
+      const conflict = new File(targetPaths.recordingsDir, recordingName);
+      if (conflict.exists) {
+        throw new Error('대상 폴더에 같은 이름의 녹음 파일이 이미 있습니다. 먼저 이름을 변경해주세요.');
+      }
+
+      const targetRecording = new File(targetPaths.recordingsDir, recordingName);
+      const targetTranscript = new File(targetPaths.transcriptsDir, `${sourceBase}.txt`);
+      const targetTranslation = new File(targetPaths.translationsDir, `${sourceBase}.txt`);
+      const targetSummary = new File(targetPaths.summariesDir, `${sourceBase}.txt`);
+      moveFileReplace(item.recordingFile, targetRecording);
+      moveFileReplace(item.transcriptFile, targetTranscript);
+      moveFileReplace(item.translationFile, targetTranslation);
+      moveFileReplace(item.summaryFile, targetSummary);
+
+      const sourceSubject = subjects.find((subject) => subject.id === sourceFolderId);
+      const targetSubject = subjects.find((subject) => subject.id === targetFolderId);
+      let cleanupRemoved = 0;
+
+      if (authToken) {
+        const moveResponse = await fetch(`${apiBaseUrl}/api/library/move`, {
+          method: 'POST',
+          headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            from_subject_id: sourceFolderId,
+            from_subject_name: sourceSubject?.name ?? sourceFolderId,
+            to_subject_id: targetFolderId,
+            to_subject_name: targetSubject?.name ?? targetFolderId,
+            recording_name: recordingName,
+          }),
+        });
+        const movePayload = await readJsonSafely(moveResponse);
+        if (!moveResponse.ok) {
+          throw new Error(getApiErrorMessage(movePayload, moveResponse, '서버 폴더 이동 실패'));
+        }
+        cleanupRemoved = Number(movePayload?.cleanup_removed_folders ?? 0);
+      }
+
+      await loadSubjects(sourceFolderId);
+      await loadSubjectFiles(sourceFolderId);
+      closeMoveModal();
+      setStatusMessage(
+        `파일 이동 완료: ${recordingName} (${sourceSubject?.name ?? sourceFolderId} → ${targetSubject?.name ?? targetFolderId})${
+          cleanupRemoved > 0 ? ` / 빈 폴더 정리 ${cleanupRemoved}개` : ''
+        }`,
+      );
+    } catch (error) {
+      setStatusMessage(`파일 이동 실패: ${formatError(error)}`);
+    } finally {
+      setIsBusy(false);
     }
   };
 
@@ -1988,6 +2109,7 @@ export default function App() {
       let skippedParts = 0;
       let syncedMetaCount = 0;
       let repairedParts = 0;
+      let cleanupRemoved = 0;
       const localPartsForVerification: Array<{
         subjectId: string;
         subjectName: string;
@@ -2197,8 +2319,21 @@ export default function App() {
       }
       await saveLocalMd5Cache(md5Cache);
 
+      try {
+        const cleanupResponse = await fetch(`${apiBaseUrl}/api/library/cleanup-empty`, {
+          method: 'POST',
+          headers: getAuthHeaders(),
+        });
+        const cleanupPayload = await readJsonSafely(cleanupResponse);
+        if (cleanupResponse.ok) {
+          cleanupRemoved = Number(cleanupPayload?.removed_folders ?? 0);
+        }
+      } catch {
+        // Cleanup failure should not mark whole upload as failed.
+      }
+
       setStatusMessage(
-        `서버 업로드 완료 (세트 ${uploadUnits}개, 파일 ${uploadedParts}/${checkedParts}개, 스킵 ${skippedParts}개, 보정 ${repairedParts}개, 메타 ${syncedMetaCount}개)`,
+        `서버 업로드 완료 (세트 ${uploadUnits}개, 파일 ${uploadedParts}/${checkedParts}개, 스킵 ${skippedParts}개, 보정 ${repairedParts}개, 메타 ${syncedMetaCount}개, 빈폴더 정리 ${cleanupRemoved}개)`,
       );
     } catch (error) {
       setStatusMessage(`서버 업로드 실패: ${formatError(error)}`);
@@ -2761,13 +2896,24 @@ export default function App() {
               <View style={styles.recordingList}>
                 {recordings.length === 0 ? <Text style={styles.helper}>저장된 녹음 파일이 없습니다.</Text> : null}
                 {recordings.map((item) => (
-                  <Pressable key={item.id} style={styles.recordingItem} onPress={() => void selectRecording(item.id)}>
-                    <Text style={styles.recordingTitle}>{item.title}</Text>
-                    <Text style={styles.recordingMeta}>
-                      {item.recordingFile.exists ? 'REC' : '-'} / {item.transcriptFile.exists ? 'TXT' : '-'} /{' '}
-                      {item.translationFile.exists ? 'TRN' : '-'} / {item.summaryFile.exists ? 'SUM' : '-'}
-                    </Text>
-                  </Pressable>
+                  <View key={item.id} style={styles.recordingItem}>
+                    <Pressable style={styles.recordingMainArea} onPress={() => void selectRecording(item.id)}>
+                      <Text style={styles.recordingTitle}>{item.title}</Text>
+                      <Text style={styles.recordingMeta}>
+                        {item.recordingFile.exists ? 'REC' : '-'} / {item.transcriptFile.exists ? 'TXT' : '-'} /{' '}
+                        {item.translationFile.exists ? 'TRN' : '-'} / {item.summaryFile.exists ? 'SUM' : '-'}
+                      </Text>
+                    </Pressable>
+                    <View style={styles.recordingActionRow}>
+                      <Pressable
+                        style={[styles.recordingMoveButton, isBusy && styles.disabledButton]}
+                        onPress={() => openMoveRecordingModal(item)}
+                        disabled={isBusy}
+                      >
+                        <Text style={styles.recordingMoveButtonText}>폴더 이동</Text>
+                      </Pressable>
+                    </View>
+                  </View>
                 ))}
               </View>
             </View>
@@ -3280,6 +3426,43 @@ export default function App() {
               </Pressable>
               <Pressable style={[styles.modalButton, styles.modalSave]} onPress={() => void saveRecordedDraft()}>
                 <Text style={styles.modalButtonText}>저장</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={moveModalVisible} transparent animationType="fade" onRequestClose={closeMoveModal}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>파일 폴더 이동</Text>
+            <Text style={styles.helper}>선택한 파일을 다른 폴더로 이동합니다.</Text>
+            <Text style={styles.modalLabel}>대상 폴더</Text>
+            <View style={styles.folderPickerList}>
+              {subjects
+                .filter((subject) => subject.id !== moveSourceFolderId)
+                .map((subject) => (
+                  <Pressable
+                    key={`move-${subject.id}`}
+                    style={[styles.folderPickerItem, moveTargetFolderId === subject.id && styles.folderPickerItemActive]}
+                    onPress={() => setMoveTargetFolderId(subject.id)}
+                  >
+                    <Text style={styles.folderPickerText}>
+                      {subject.icon} {subject.name}
+                    </Text>
+                  </Pressable>
+                ))}
+            </View>
+            <View style={styles.modalActions}>
+              <Pressable style={[styles.modalButton, styles.modalCancel]} onPress={closeMoveModal}>
+                <Text style={styles.modalButtonText}>취소</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.modalButton, styles.modalSave, isBusy && styles.disabledButton]}
+                onPress={() => void moveRecordingToFolder()}
+                disabled={isBusy}
+              >
+                <Text style={styles.modalButtonText}>이동</Text>
               </Pressable>
             </View>
           </View>
@@ -4380,6 +4563,27 @@ const styles = StyleSheet.create({
     backgroundColor: '#EEF2FF',
     paddingHorizontal: 10,
     paddingVertical: 9,
+    gap: 8,
+  },
+  recordingMainArea: {
+    gap: 2,
+  },
+  recordingActionRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+  },
+  recordingMoveButton: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#93C5FD',
+    backgroundColor: '#EEF6FF',
+    paddingHorizontal: 11,
+    paddingVertical: 5,
+  },
+  recordingMoveButtonText: {
+    color: '#1E3A8A',
+    fontSize: 12,
+    fontWeight: '800',
   },
   recordingItemActive: {
     borderColor: '#1D4ED8',
