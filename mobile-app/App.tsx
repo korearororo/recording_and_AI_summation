@@ -1987,6 +1987,20 @@ export default function App() {
       let uploadedParts = 0;
       let skippedParts = 0;
       let syncedMetaCount = 0;
+      let repairedParts = 0;
+      const localPartsForVerification: Array<{
+        subjectId: string;
+        subjectName: string;
+        subjectTag: string;
+        subjectIcon: string;
+        subjectColor: string;
+        subjectOrder: number;
+        kind: 'recording' | 'transcript' | 'translation' | 'summary';
+        name: string;
+        file: File;
+        mimeType: string;
+        md5: string;
+      }> = [];
       for (const dir of dirs) {
         const subjectId = dir.name;
         const paths = getSubjectPaths(subjectId);
@@ -2045,8 +2059,21 @@ export default function App() {
             mimeType: string,
           ) => {
             checkedParts += 1;
-            const remote = cloudMetaLookup[cloudLookupKey(subjectId, kind, name)];
             const localMd5 = getFileMd5Cached(file, md5Cache);
+            localPartsForVerification.push({
+              subjectId,
+              subjectName,
+              subjectTag,
+              subjectIcon,
+              subjectColor,
+              subjectOrder,
+              kind,
+              name,
+              file,
+              mimeType,
+              md5: localMd5,
+            });
+            const remote = cloudMetaLookup[cloudLookupKey(subjectId, kind, name)];
             if (remote?.md5 && localMd5 && remote.md5 === localMd5) {
               skippedParts += 1;
               return;
@@ -2110,10 +2137,68 @@ export default function App() {
           });
         }
       }
+
+      if (localPartsForVerification.length > 0) {
+        setStatusMessage('서버 업로드 검증 중...');
+        const verifyResponse = await fetch(`${apiBaseUrl}/api/library`, {
+          headers: getAuthHeaders(),
+        });
+        const verifyPayload = await readJsonSafely(verifyResponse);
+        if (!verifyResponse.ok) {
+          throw new Error(getApiErrorMessage(verifyPayload, verifyResponse, '업로드 검증 목록 조회 실패'));
+        }
+        const verifySubjects = normalizeCloudSubjectSnapshots(verifyPayload?.subjects);
+        const verifyLookup = buildCloudMetaLookup(verifySubjects);
+        const repairTasks: Array<() => Promise<void>> = [];
+
+        for (const part of localPartsForVerification) {
+          const remote = verifyLookup[cloudLookupKey(part.subjectId, part.kind, part.name)];
+          const remoteMd5 = (remote?.md5 || '').trim().toLowerCase();
+          const localMd5 = (part.md5 || '').trim().toLowerCase();
+          const needsRepair =
+            !remote || (localMd5 && ((!remoteMd5 && !!remote) || (remoteMd5 && remoteMd5 !== localMd5)));
+          if (!needsRepair) {
+            continue;
+          }
+
+          repairTasks.push(async () => {
+            if (!part.file.exists) {
+              return;
+            }
+            const form = new FormData();
+            form.append('subject_id', part.subjectId);
+            form.append('subject_name', part.subjectName);
+            form.append('subject_tag', part.subjectTag);
+            form.append('subject_icon', part.subjectIcon);
+            form.append('subject_color', part.subjectColor);
+            form.append('subject_order', String(part.subjectOrder));
+            form.append(`${part.kind}_name`, part.name);
+            if (localMd5) {
+              form.append(`${part.kind}_md5`, localMd5);
+            }
+            form.append(
+              part.kind,
+              {
+                uri: part.file.uri,
+                name: part.name,
+                type: part.mimeType,
+              } as any,
+            );
+            await postLibrarySync(form);
+            repairedParts += 1;
+          });
+        }
+
+        if (repairTasks.length > 0) {
+          await runTasksWithConcurrency(repairTasks, 1, (done, total) => {
+            setStatusMessage(`서버 업로드 보정 중... ${done}/${total}`);
+          });
+        }
+      }
       await saveLocalMd5Cache(md5Cache);
 
       setStatusMessage(
-        `서버 업로드 완료 (세트 ${uploadUnits}개, 파일 ${uploadedParts}/${checkedParts}개, 스킵 ${skippedParts}개, 메타 ${syncedMetaCount}개)`,
+        `서버 업로드 완료 (세트 ${uploadUnits}개, 파일 ${uploadedParts}/${checkedParts}개, 스킵 ${skippedParts}개, 보정 ${repairedParts}개, 메타 ${syncedMetaCount}개)`,
       );
     } catch (error) {
       setStatusMessage(`서버 업로드 실패: ${formatError(error)}`);
