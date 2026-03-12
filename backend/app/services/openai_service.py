@@ -20,6 +20,8 @@ SYSTEM_SUMMARY_PROMPT = (
 SYSTEM_TRANSLATE_PROMPT = (
     "You are a precise lecture translator. "
     "Translate only the provided text to the target language while preserving structure, terminology, and numbers. "
+    "If the source contains mixed languages, translate all translatable parts into the target language consistently. "
+    "Keep only proper nouns, code, and well-known acronyms as-is when translation would be unnatural. "
     "Do not summarize or add new information. Return only translated text."
 )
 
@@ -33,6 +35,8 @@ CHAT_TRANSCRIBE_PROMPT = (
 CHAT_TRANSLATE_PROMPT = (
     "너는 강의 번역 도우미다. "
     "입력 텍스트를 목표 언어로만 번역해라. "
+    "입력에 한글/영어가 섞여 있어도 번역 가능한 부분은 전부 목표 언어로 통일해라. "
+    "고유명사, 코드, 약어만 필요한 경우 원문 유지 가능하다. "
     "요약/추측/추가 설명 금지, 문단 구조와 용어를 최대한 유지해라."
 )
 
@@ -88,18 +92,12 @@ class OpenAIService:
 
     def translate_text(self, text: str, target_language: str) -> str:
         target = _normalize_target_language(target_language)
-        response = self.client.responses.create(
-            model=self.settings.translation_model,
-            instructions=f"{SYSTEM_TRANSLATE_PROMPT} Target language: {target}.",
-            input=text,
-        )
+        primary = self._translate_once_with_api(text, target, strict=False)
+        if not _looks_untranslated(text, primary):
+            return primary
 
-        output_text = getattr(response, "output_text", None)
-        if isinstance(output_text, str) and output_text.strip():
-            return output_text.strip()
-
-        extracted = _extract_text_from_response(response)
-        return extracted.strip() if extracted.strip() else "번역 생성 실패"
+        retry = self._translate_once_with_api(text, target, strict=True)
+        return retry if retry else (primary if primary else "번역 생성 실패")
 
     def transcribe_with_chat(self, file_path: str) -> str:
         raw = self.transcribe_file(file_path)
@@ -126,15 +124,56 @@ class OpenAIService:
 
     def translate_with_chat(self, text: str, target_language: str) -> str:
         target = _normalize_target_language(target_language)
+        primary = self._translate_once_with_chat(text, target, strict=False)
+        if not _looks_untranslated(text, primary):
+            return primary
+
+        retry = self._translate_once_with_chat(text, target, strict=True)
+        if retry and not _looks_untranslated(text, retry):
+            return retry
+
+        # Final fallback for mixed-language edge cases.
+        fallback = self._translate_once_with_api(text, target, strict=True)
+        return fallback if fallback else (retry if retry else (primary if primary else "번역 생성 실패"))
+
+    def _translate_once_with_api(self, text: str, target: str, strict: bool) -> str:
+        strict_suffix = (
+            " STRICT MODE: The input can be mixed Korean and English. "
+            "Translate every translatable segment into the target language, sentence by sentence. "
+            "Avoid leaving source-language sentences unchanged unless they are proper nouns, code, or acronyms."
+            if strict
+            else ""
+        )
+        response = self.client.responses.create(
+            model=self.settings.translation_model,
+            instructions=f"{SYSTEM_TRANSLATE_PROMPT} Target language: {target}.{strict_suffix}",
+            input=text,
+        )
+        output_text = getattr(response, "output_text", None)
+        if isinstance(output_text, str) and output_text.strip():
+            return _cleanup_translation_tags(output_text.strip())
+
+        extracted = _extract_text_from_response(response)
+        candidate = _cleanup_translation_tags(extracted.strip())
+        return candidate if candidate else "번역 생성 실패"
+
+    def _translate_once_with_chat(self, text: str, target: str, strict: bool) -> str:
+        strict_suffix = (
+            " 엄격 모드: 한글/영어 혼합 입력이어도 번역 가능한 부분은 모두 목표 언어로 변환해라. "
+            "원문 유지 허용은 고유명사/코드/약어로 제한한다."
+            if strict
+            else ""
+        )
         response = self.client.responses.create(
             model=self.settings.chat_translation_model,
-            instructions=f"{CHAT_TRANSLATE_PROMPT} 목표 언어: {target}.",
+            instructions=f"{CHAT_TRANSLATE_PROMPT} 목표 언어: {target}.{strict_suffix}",
             input=f"<TEXT>\n{text}\n</TEXT>",
         )
 
         output_text = getattr(response, "output_text", None)
         if isinstance(output_text, str) and output_text.strip():
             return _cleanup_translation_tags(output_text.strip())
+
         extracted = _extract_text_from_response(response)
         candidate = _cleanup_translation_tags(extracted.strip())
         return candidate if candidate else "번역 생성 실패"
@@ -310,6 +349,26 @@ def _looks_like_empty_summary(text: str) -> bool:
 def _normalize_target_language(value: str) -> str:
     normalized = (value or "").strip()
     return normalized[:40] if normalized else "English"
+
+
+def _looks_untranslated(source: str, translated: str) -> bool:
+    cleaned_source = _compact_for_compare(source)
+    cleaned_translated = _compact_for_compare(translated)
+    if not cleaned_source or not cleaned_translated:
+        return False
+    if cleaned_source == cleaned_translated:
+        return True
+
+    # If 95%+ of the translated text matches source prefixes, it is likely untouched.
+    match_len = 0
+    max_len = min(len(cleaned_source), len(cleaned_translated))
+    while match_len < max_len and cleaned_source[match_len] == cleaned_translated[match_len]:
+        match_len += 1
+    return (match_len / max_len) >= 0.95 if max_len > 0 else False
+
+
+def _compact_for_compare(value: str) -> str:
+    return "".join(ch.lower() for ch in value if ch.isalnum())
 
 
 def _should_retry_with_chunking(error: Exception) -> bool:
