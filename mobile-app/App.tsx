@@ -16,6 +16,7 @@ import {
 import { LinearGradient } from 'expo-linear-gradient';
 import Constants from 'expo-constants';
 import { Directory, File, Paths } from 'expo-file-system';
+import * as LegacyFileSystem from 'expo-file-system/legacy';
 import * as Linking from 'expo-linking';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Notifications from 'expo-notifications';
@@ -274,6 +275,27 @@ export default function App() {
       return {};
     }
     return { Authorization: `Bearer ${authToken}` };
+  };
+
+  const refreshCloudRootDir = async (tokenOverride?: string) => {
+    const token = (tokenOverride || authToken || '').trim();
+    if (!token) {
+      setCloudRootDir('');
+      return;
+    }
+    try {
+      const response = await fetchWithTimeout(`${apiBaseUrl}/api/library`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const payload = await readJsonSafely(response);
+      if (!response.ok) {
+        return;
+      }
+      const root = typeof payload?.root_dir === 'string' ? payload.root_dir : '';
+      setCloudRootDir(root);
+    } catch {
+      // Cloud root lookup failure should not block normal app usage.
+    }
   };
 
   const selectedSubject = useMemo(
@@ -855,6 +877,7 @@ export default function App() {
   const clearAuthSession = () => {
     setAuthToken('');
     setAuthUser(null);
+    setCloudRootDir('');
     persistAuthSession('', null);
   };
 
@@ -872,9 +895,9 @@ export default function App() {
         return;
       }
 
-      const response = await fetch(`${apiBaseUrl}/api/auth/me`, {
+      const response = await fetchWithTimeout(`${apiBaseUrl}/api/auth/me`, {
         headers: { Authorization: `Bearer ${token}` },
-      });
+      }, 8000);
       const payload = await readJsonSafely(response);
       if (!response.ok) {
         clearAuthSession();
@@ -888,6 +911,7 @@ export default function App() {
       setAuthToken(token);
       setAuthUser(user);
       persistAuthSession(token, user);
+      await refreshCloudRootDir(token);
     } catch {
       clearAuthSession();
     }
@@ -935,6 +959,7 @@ export default function App() {
       setAuthToken(token);
       setAuthUser(user);
       persistAuthSession(token, user);
+      await refreshCloudRootDir(token);
       setAuthModalVisible(false);
       setAuthPassword('');
       setStatusMessage(`${user.display_name} 계정으로 로그인되었습니다.`);
@@ -991,6 +1016,7 @@ export default function App() {
       setAuthToken(token);
       setAuthUser(user);
       persistAuthSession(token, user);
+      await refreshCloudRootDir(token);
       setAuthModalVisible(false);
       setAuthPassword('');
       setStatusMessage(`${SOCIAL_PROVIDER_LABELS[provider]} 계정으로 로그인되었습니다.`);
@@ -2699,6 +2725,62 @@ export default function App() {
     ]);
   };
 
+  const exportAllLocalFiles = async () => {
+    if (Platform.OS !== 'android') {
+      Alert.alert('내보내기 안내', '현재 버전의 전체 내보내기는 Android에서 지원됩니다.');
+      return;
+    }
+
+    try {
+      setIsBusy(true);
+      setStatusMessage('내보내기 폴더 권한 요청 중...');
+
+      const permission = await LegacyFileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
+      if (!permission.granted || !permission.directoryUri) {
+        setStatusMessage('내보내기 취소: 저장 위치 권한이 필요합니다.');
+        return;
+      }
+
+      const exportFolderName = `recording-ai-export-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+      const exportRootUri = await LegacyFileSystem.StorageAccessFramework.makeDirectoryAsync(
+        permission.directoryUri,
+        exportFolderName,
+      );
+
+      const exportFiles = collectExportFiles();
+      const dirUriCache = new Map<string, string>();
+      dirUriCache.set('', exportRootUri);
+
+      let exportedCount = 0;
+      for (let index = 0; index < exportFiles.length; index += 1) {
+        const row = exportFiles[index];
+        setStatusMessage(`로컬 파일 내보내는 중... (${index + 1}/${exportFiles.length})`);
+        await copyFileToSafDirectory(
+          row.file,
+          row.relativePath,
+          row.mimeType,
+          exportRootUri,
+          dirUriCache,
+        );
+        exportedCount += 1;
+      }
+
+      const manifest = {
+        exportedAt: new Date().toISOString(),
+        fileCount: exportedCount,
+        root: 'subjects',
+      };
+      await writeSafTextFile(exportRootUri, 'export-manifest.json', JSON.stringify(manifest, null, 2), dirUriCache);
+
+      setStatusMessage(`내보내기 완료: ${exportedCount}개 파일 / ${exportFolderName}`);
+      Alert.alert('내보내기 완료', `${exportedCount}개 파일을 내 파일로 복사했습니다.\n폴더명: ${exportFolderName}`);
+    } catch (error) {
+      setStatusMessage(`내보내기 실패: ${formatError(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
   const exportSubjectFile = async (kind: 'recording' | 'transcript' | 'translation' | 'summary') => {
     if (!selectedSubject || !selectedRecording) {
       setStatusMessage('파일을 선택해주세요.');
@@ -2909,8 +2991,16 @@ export default function App() {
                   </View>
                 </Pressable>
               </View>
+              <Pressable
+                style={[styles.cloudArchiveButton, isBusy && styles.disabledButton]}
+                onPress={exportAllLocalFiles}
+                disabled={isBusy}
+              >
+                <Text style={styles.cloudArchiveButtonText}>로컬 파일 내보내기 (내 파일)</Text>
+              </Pressable>
               {cloudRootDir ? (
                 <View style={styles.cloudLocationRow}>
+                  <Text style={styles.cloudLocationText}>저장 백엔드: {cloudStorageModeLabel(cloudRootDir)}</Text>
                   <Text style={styles.cloudLocationText}>클라우드 위치: {cloudRootDir}</Text>
                   {toDriveWebUrl(cloudRootDir) ? (
                     <Pressable
@@ -3534,7 +3624,11 @@ export default function App() {
               placeholderTextColor="#94A3B8"
             />
             <Text style={styles.modalLabel}>저장 폴더</Text>
-            <View style={styles.folderPickerList}>
+            <ScrollView
+              style={styles.folderPickerScroll}
+              contentContainerStyle={styles.folderPickerScrollContent}
+              nestedScrollEnabled
+            >
               {subjects.map((subject) => (
                 <Pressable
                   key={`save-${subject.id}`}
@@ -3549,7 +3643,7 @@ export default function App() {
                   </Text>
                 </Pressable>
               ))}
-            </View>
+            </ScrollView>
             <View style={styles.modalActions}>
               <Pressable style={[styles.modalButton, styles.modalCancel]} onPress={cancelRecordingSave}>
                 <Text style={styles.modalButtonText}>취소(임시저장)</Text>
@@ -4035,6 +4129,155 @@ function recordingMimeType(fileName: string): string {
   return 'audio/m4a';
 }
 
+type ExportFileItem = {
+  file: File;
+  relativePath: string;
+  mimeType: string;
+};
+
+function guessMimeType(fileName: string): string {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith('.json')) return 'application/json';
+  if (lower.endsWith('.txt')) return 'text/plain';
+  if (lower.endsWith('.wav')) return 'audio/wav';
+  if (lower.endsWith('.mp3')) return 'audio/mpeg';
+  if (lower.endsWith('.aac')) return 'audio/aac';
+  if (lower.endsWith('.webm')) return 'audio/webm';
+  if (lower.endsWith('.mp4')) return 'video/mp4';
+  if (lower.endsWith('.3gp')) return 'video/3gpp';
+  if (lower.endsWith('.m4a')) return 'audio/m4a';
+  if (lower.endsWith('.url')) return 'text/plain';
+  return 'application/octet-stream';
+}
+
+function collectExportFiles(): ExportFileItem[] {
+  const rows: ExportFileItem[] = [];
+
+  const walk = (directory: Directory, basePath: string) => {
+    if (!directory.exists) {
+      return;
+    }
+    for (const entry of directory.list()) {
+      if (entry instanceof Directory) {
+        walk(entry, `${basePath}/${entry.name}`);
+        continue;
+      }
+      if (entry instanceof File && entry.exists) {
+        rows.push({
+          file: entry,
+          relativePath: `${basePath}/${entry.name}`,
+          mimeType: guessMimeType(entry.name),
+        });
+      }
+    }
+  };
+
+  walk(SUBJECTS_ROOT, 'subjects');
+
+  if (PENDING_JOBS_FILE.exists) {
+    rows.push({
+      file: PENDING_JOBS_FILE,
+      relativePath: 'pending-jobs.json',
+      mimeType: 'application/json',
+    });
+  }
+  if (CLOUD_MD5_CACHE_FILE.exists) {
+    rows.push({
+      file: CLOUD_MD5_CACHE_FILE,
+      relativePath: 'cloud-md5-cache.json',
+      mimeType: 'application/json',
+    });
+  }
+
+  return rows;
+}
+
+function splitPathSegments(value: string): string[] {
+  return value
+    .split('/')
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+}
+
+async function ensureSafDirectory(
+  rootUri: string,
+  relativeDirPath: string,
+  cache: Map<string, string>,
+): Promise<string> {
+  const segments = splitPathSegments(relativeDirPath);
+  if (segments.length === 0) {
+    return rootUri;
+  }
+
+  let currentUri = rootUri;
+  let currentPath = '';
+
+  for (const segment of segments) {
+    currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+    const cachedUri = cache.get(currentPath);
+    if (cachedUri) {
+      currentUri = cachedUri;
+      continue;
+    }
+    const nextUri = await LegacyFileSystem.StorageAccessFramework.makeDirectoryAsync(currentUri, segment);
+    cache.set(currentPath, nextUri);
+    currentUri = nextUri;
+  }
+
+  return currentUri;
+}
+
+function splitRelativeFilePath(value: string): { directoryPath: string; fileName: string } {
+  const normalized = value.trim().replace(/^\/+|\/+$/g, '');
+  const segments = splitPathSegments(normalized);
+  if (segments.length === 0) {
+    throw new Error('유효하지 않은 내보내기 경로입니다.');
+  }
+  const fileName = segments[segments.length - 1];
+  const directoryPath = segments.slice(0, -1).join('/');
+  return { directoryPath, fileName };
+}
+
+async function copyFileToSafDirectory(
+  source: File,
+  relativePath: string,
+  mimeType: string,
+  rootUri: string,
+  cache: Map<string, string>,
+): Promise<void> {
+  if (!source.exists) {
+    return;
+  }
+  const { directoryPath, fileName } = splitRelativeFilePath(relativePath);
+  const targetDirectoryUri = await ensureSafDirectory(rootUri, directoryPath, cache);
+  const targetFileUri = await LegacyFileSystem.StorageAccessFramework.createFileAsync(
+    targetDirectoryUri,
+    fileName,
+    mimeType,
+  );
+  const base64 = await LegacyFileSystem.readAsStringAsync(source.uri, {
+    encoding: LegacyFileSystem.EncodingType.Base64,
+  });
+  await LegacyFileSystem.writeAsStringAsync(targetFileUri, base64, {
+    encoding: LegacyFileSystem.EncodingType.Base64,
+  });
+}
+
+async function writeSafTextFile(
+  rootUri: string,
+  fileName: string,
+  content: string,
+  cache: Map<string, string>,
+): Promise<void> {
+  const targetDirectoryUri = await ensureSafDirectory(rootUri, '', cache);
+  const targetFileUri = await LegacyFileSystem.StorageAccessFramework.createFileAsync(
+    targetDirectoryUri,
+    fileName,
+    'application/json',
+  );
+  await LegacyFileSystem.writeAsStringAsync(targetFileUri, content);
+}
+
 async function runTasksWithConcurrency<T>(
   tasks: Array<() => Promise<T>>,
   concurrency: number,
@@ -4280,6 +4523,23 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  timeoutMs: number = 12000,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, {
+      ...(init || {}),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function downloadToFileWithAuth(url: string, destination: File, headers: Record<string, string>): Promise<void> {
   const response = await fetch(url, { headers });
   if (!response.ok) {
@@ -4345,6 +4605,17 @@ function toDriveWebUrl(value: string): string {
     }
   }
   return '';
+}
+
+function cloudStorageModeLabel(rootDir: string): string {
+  const value = (rootDir || '').trim().toLowerCase();
+  if (!value) {
+    return '알 수 없음';
+  }
+  if (value.startsWith('drive://folder/')) {
+    return 'Google Drive';
+  }
+  return '서버 로컬 스토리지';
 }
 
 function getApiErrorMessage(payload: any, response: Response, fallback: string, requestUrl?: string): string {
@@ -5091,6 +5362,13 @@ const styles = StyleSheet.create({
   folderPickerList: {
     maxHeight: 160,
     gap: 6,
+  },
+  folderPickerScroll: {
+    maxHeight: 200,
+  },
+  folderPickerScrollContent: {
+    gap: 6,
+    paddingBottom: 2,
   },
   folderPickerItem: {
     borderWidth: 1,

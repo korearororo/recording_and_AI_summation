@@ -63,14 +63,19 @@ cd backend\deploy\windows
 - Uploaded library files:
   - Local mode (default): `LIBRARY_ROOT` (default `backend/library`)
     - Per-user folder: `library/user_<user_id>/`
-    - Per-subject folder: `<subject_name>__<subject_id>/recordings|transcripts|translations|summaries`
+    - Per-subject folder: `<subject_name>__<subject_id>/entries/<entry_key>/`
+    - Per-entry files: `recording__*.m4a`, `transcript__*.txt`, `translation__*.txt`, `summary__*.txt`
   - Google Drive mode (`GOOGLE_DRIVE_ENABLED=true`):
     - Root folder: `GOOGLE_DRIVE_ROOT_FOLDER_ID` (or auto-created `RecordingAI-Library`)
     - Per-user folder: `user_<user_id>`
-    - Per-subject folder: `<subject_name>__<subject_id>/recordings|transcripts|translations|summaries`
+    - Per-subject folder: `<subject_name>__<subject_id>/<entry_key>/`
+    - Per-entry files: `recording__*`, `transcript__*`, `translation__*`, `summary__*`
     - Auth options:
       - Service account JSON (best with Shared Drive)
       - OAuth refresh token (recommended for personal Google Drive)
+    - Important: `GOOGLE_DRIVE_ENABLED=true` alone is not enough. You must also set either:
+      - `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON`, or
+      - all three OAuth values: `GOOGLE_DRIVE_OAUTH_CLIENT_ID`, `GOOGLE_DRIVE_OAUTH_CLIENT_SECRET`, `GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN`
 
 ### Google Drive Service Account Note
 - `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` can be:
