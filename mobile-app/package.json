@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "expo": "~55.0.5",
+    "expo-asset": "~55.0.9",
     "expo-audio": "~55.0.8",
     "expo-constants": "~55.0.7",
     "expo-document-picker": "^55.0.8",

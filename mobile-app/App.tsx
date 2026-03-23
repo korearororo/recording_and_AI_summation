@@ -20,7 +20,6 @@ import * as LegacyFileSystem from 'expo-file-system/legacy';
 import * as Linking from 'expo-linking';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Notifications from 'expo-notifications';
-import * as Sharing from 'expo-sharing';
 import * as WebBrowser from 'expo-web-browser';
 import {
   RecordingPresets,
@@ -33,6 +32,7 @@ import {
 
 type ProcessMode = 'api' | 'chat';
 type SubjectTag = 'major' | 'general' | 'exam';
+type WorkspaceKey = 'university' | 'church';
 
 type SubjectTagStyle = {
   label: string;
@@ -144,7 +144,24 @@ const PENDING_JOBS_FILE = new File(Paths.document, 'pending-jobs.json');
 const AUTH_SESSION_FILE = new File(Paths.document, 'auth-session.json');
 const TEMP_RECORDINGS_ROOT = new Directory(Paths.cache, 'temp-recordings');
 const CLOUD_MD5_CACHE_FILE = new File(Paths.document, 'cloud-md5-cache.json');
-const FOLDER_ICON_OPTIONS = ['📁', '📘', '📗', '📕', '🧪', '💻', '📊', '🎵'];
+const FOLDER_ICON_OPTIONS = [
+  '📁',
+  '📘',
+  '📗',
+  '📕',
+  '🧪',
+  '💻',
+  '📊',
+  '🎵',
+  '⛪',
+  '✝️',
+  '🙏',
+  '📖',
+  '🎙️',
+  '🎼',
+  '🕊️',
+  '🛐',
+];
 const FOLDER_COLOR_OPTIONS = ['#DBEAFE', '#E9D5FF', '#FCE7F3', '#DCFCE7', '#FEF3C7', '#E0F2FE', '#F1F5F9'];
 const DEFAULT_FOLDER_ICON = '📁';
 const DEFAULT_FOLDER_COLOR = '#DBEAFE';
@@ -167,7 +184,17 @@ Notifications.setNotificationHandler({
   }),
 });
 
-const SUBJECTS_ROOT = new Directory(Paths.document, 'subjects');
+const LEGACY_SUBJECTS_ROOT = new Directory(Paths.document, 'subjects');
+const WORKSPACES_ROOT = new Directory(Paths.document, 'workspaces');
+const WORKSPACE_SUBJECTS_ROOTS: Record<WorkspaceKey, Directory> = {
+  university: new Directory(WORKSPACES_ROOT, 'university'),
+  church: new Directory(WORKSPACES_ROOT, 'church'),
+};
+const WORKSPACE_LABELS: Record<WorkspaceKey, string> = {
+  university: '대학교 수업 강의 요약',
+  church: '교회 설교 요약',
+};
+let runtimeSubjectsRoot: Directory = WORKSPACE_SUBJECTS_ROOTS.university;
 const LECTURE_RECORDING_PRESET = {
   ...RecordingPresets.HIGH_QUALITY,
   sampleRate: 16000,
@@ -194,6 +221,7 @@ export default function App() {
   const recorder = useAudioRecorder(LECTURE_RECORDING_PRESET as any);
   const recorderState = useAudioRecorderState(recorder, 250);
 
+  const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceKey>('university');
   const [subjects, setSubjects] = useState<SubjectItem[]>([]);
   const [selectedSubjectId, setSelectedSubjectId] = useState<string | null>(null);
   const [folderModalVisible, setFolderModalVisible] = useState(false);
@@ -213,6 +241,9 @@ export default function App() {
   const [moveSourceFolderId, setMoveSourceFolderId] = useState<string | null>(null);
   const [moveTargetFolderId, setMoveTargetFolderId] = useState<string | null>(null);
   const [moveRecordingId, setMoveRecordingId] = useState<string | null>(null);
+  const [subjectMoveModalVisible, setSubjectMoveModalVisible] = useState(false);
+  const [subjectMoveSourceId, setSubjectMoveSourceId] = useState<string | null>(null);
+  const [subjectMoveTargetWorkspace, setSubjectMoveTargetWorkspace] = useState<WorkspaceKey>('church');
   const [recordingDraftUri, setRecordingDraftUri] = useState<string | null>(null);
   const [recordingSaveVisible, setRecordingSaveVisible] = useState(false);
   const [recordingSaveName, setRecordingSaveName] = useState('');
@@ -224,7 +255,7 @@ export default function App() {
   const [transcript, setTranscript] = useState('');
   const [translation, setTranslation] = useState('');
   const [summary, setSummary] = useState('');
-  const [screenMode, setScreenMode] = useState<'home' | 'subject' | 'detail' | 'record'>('home');
+  const [screenMode, setScreenMode] = useState<'home' | 'subject' | 'detail' | 'record' | 'settings'>('home');
   const [editorVisible, setEditorVisible] = useState(false);
   const [editorTarget, setEditorTarget] = useState<'transcript' | 'translation' | 'summary' | null>(null);
   const [editorText, setEditorText] = useState('');
@@ -314,6 +345,42 @@ export default function App() {
     () => recordings.find((item) => item.id === selectedRecordingId) ?? null,
     [recordings, selectedRecordingId],
   );
+  const isChurchWorkspace = activeWorkspace === 'church';
+  const workspaceTheme = useMemo(
+    () =>
+      isChurchWorkspace
+        ? {
+            background: ['#FFF5F5', '#FEE2E2', '#FECACA'] as const,
+            title: '#7F1D1D',
+            subtitle: '#991B1B',
+            cardBorder: 'rgba(185,28,28,0.2)',
+            cardBg: 'rgba(255,255,255,0.94)',
+            accentBorder: 'rgba(185,28,28,0.25)',
+            accentSurface: 'rgba(255,255,255,0.94)',
+            softButtonBorder: '#FCA5A5',
+            softButtonBg: '#FFF1F2',
+            softButtonText: '#991B1B',
+            strongButtonBg: '#B91C1C',
+            strongButtonText: '#FFF1F2',
+            sectionTitle: '#B91C1C',
+          }
+        : {
+            background: ['#F7F9FC', '#EAF1FB', '#DCE9FF'] as const,
+            title: '#0F172A',
+            subtitle: '#334155',
+            cardBorder: 'rgba(37,99,235,0.16)',
+            cardBg: 'rgba(255,255,255,0.9)',
+            accentBorder: 'rgba(37,99,235,0.2)',
+            accentSurface: 'rgba(255,255,255,0.92)',
+            softButtonBorder: '#93C5FD',
+            softButtonBg: '#EEF6FF',
+            softButtonText: '#1E3A8A',
+            strongButtonBg: '#2563EB',
+            strongButtonText: '#FFFFFF',
+            sectionTitle: '#1D4ED8',
+          },
+    [isChurchWorkspace],
+  );
 
   const isRecording = recorderState.isRecording;
   const durationSeconds = Math.floor(recorderState.durationMillis / 1000);
@@ -330,6 +397,21 @@ export default function App() {
   useEffect(() => {
     void initialize();
   }, []);
+
+  useEffect(() => {
+    setRuntimeSubjectsRoot(WORKSPACE_SUBJECTS_ROOTS[activeWorkspace]);
+    setSelectedSubjectId(null);
+    setSelectedRecordingId(null);
+    setRecordings([]);
+    setRecordingUri(null);
+    setTranscript('');
+    setTranslation('');
+    setSummary('');
+    if (screenMode !== 'home' && screenMode !== 'settings') {
+      setScreenMode('home');
+    }
+    void loadSubjects();
+  }, [activeWorkspace]);
 
   useEffect(() => {
     if (pendingJobs.length === 0) {
@@ -394,6 +476,10 @@ export default function App() {
         setMoveModalVisible(false);
         return true;
       }
+      if (subjectMoveModalVisible) {
+        closeMoveSubjectWorkspaceModal();
+        return true;
+      }
       if (fabOpen) {
         setFabOpen(false);
         return true;
@@ -402,7 +488,7 @@ export default function App() {
         setScreenMode('subject');
         return true;
       }
-      if (screenMode === 'subject' || screenMode === 'record') {
+      if (screenMode === 'subject' || screenMode === 'record' || screenMode === 'settings') {
         setScreenMode('home');
         return true;
       }
@@ -418,6 +504,7 @@ export default function App() {
     fabOpen,
     folderModalVisible,
     moveModalVisible,
+    subjectMoveModalVisible,
     recordingSaveVisible,
     renameVisible,
     screenMode,
@@ -425,6 +512,8 @@ export default function App() {
   ]);
 
   const initialize = async () => {
+    await migrateLegacySubjectsToWorkspace();
+    setRuntimeSubjectsRoot(WORKSPACE_SUBJECTS_ROOTS[activeWorkspace]);
     ensureSubjectsRoot();
     await setupNotifications();
     await restoreAuthSession();
@@ -708,6 +797,64 @@ export default function App() {
     setMoveSourceFolderId(null);
     setMoveRecordingId(null);
     setMoveTargetFolderId(null);
+  };
+
+  const openMoveSubjectWorkspaceModal = (subject: SubjectItem) => {
+    setSubjectMoveSourceId(subject.id);
+    setSubjectMoveTargetWorkspace(activeWorkspace === 'university' ? 'church' : 'university');
+    setSubjectMoveModalVisible(true);
+  };
+
+  const closeMoveSubjectWorkspaceModal = () => {
+    setSubjectMoveModalVisible(false);
+    setSubjectMoveSourceId(null);
+    setSubjectMoveTargetWorkspace(activeWorkspace === 'university' ? 'church' : 'university');
+  };
+
+  const moveSubjectToWorkspace = async () => {
+    const sourceId = subjectMoveSourceId;
+    if (!sourceId) {
+      setStatusMessage('이동할 폴더를 선택해주세요.');
+      return;
+    }
+    if (subjectMoveTargetWorkspace === activeWorkspace) {
+      setStatusMessage('같은 영역으로는 이동할 수 없습니다.');
+      return;
+    }
+
+    try {
+      setIsBusy(true);
+      const sourceRoot = WORKSPACE_SUBJECTS_ROOTS[activeWorkspace];
+      const targetRoot = WORKSPACE_SUBJECTS_ROOTS[subjectMoveTargetWorkspace];
+      ensureSubjectsRoot(sourceRoot);
+      ensureSubjectsRoot(targetRoot);
+
+      const sourceDir = new Directory(sourceRoot, sourceId);
+      if (!sourceDir.exists) {
+        throw new Error('원본 폴더를 찾지 못했습니다.');
+      }
+      const targetDir = new Directory(targetRoot, sourceId);
+      if (targetDir.exists) {
+        throw new Error('대상 영역에 같은 폴더가 이미 있습니다.');
+      }
+      sourceDir.move(targetDir);
+
+      if (selectedSubjectId === sourceId) {
+        setSelectedSubjectId(null);
+        setSelectedRecordingId(null);
+        setRecordings([]);
+        setScreenMode('home');
+      }
+      await loadSubjects();
+      closeMoveSubjectWorkspaceModal();
+      setStatusMessage(
+        `폴더 이동 완료: ${sourceId} (${WORKSPACE_LABELS[activeWorkspace]} -> ${WORKSPACE_LABELS[subjectMoveTargetWorkspace]})`,
+      );
+    } catch (error) {
+      setStatusMessage(`폴더 이동 실패: ${formatError(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   const moveFileReplace = (source: File, destination: File) => {
@@ -2170,7 +2317,7 @@ export default function App() {
       const cloudMetaLookup = buildCloudMetaLookup(cloudSubjects);
       const md5Cache = await loadLocalMd5Cache();
 
-      const dirs = SUBJECTS_ROOT.list().filter((entry): entry is Directory => entry instanceof Directory);
+      const dirs = runtimeSubjectsRoot.list().filter((entry): entry is Directory => entry instanceof Directory);
       if (dirs.length === 0) {
         setStatusMessage('업로드할 폴더가 없습니다.');
         return;
@@ -2768,7 +2915,7 @@ export default function App() {
       const manifest = {
         exportedAt: new Date().toISOString(),
         fileCount: exportedCount,
-        root: 'subjects',
+        root: `workspaces/${getRuntimeWorkspaceKey()}`,
       };
       await writeSafTextFile(exportRootUri, 'export-manifest.json', JSON.stringify(manifest, null, 2), dirUriCache);
 
@@ -2781,43 +2928,55 @@ export default function App() {
     }
   };
 
-  const exportSubjectFile = async (kind: 'recording' | 'transcript' | 'translation' | 'summary') => {
-    if (!selectedSubject || !selectedRecording) {
-      setStatusMessage('파일을 선택해주세요.');
+  const exportCurrentRecordingToLocal = async () => {
+    if (Platform.OS !== 'android') {
+      Alert.alert('내보내기 안내', '현재 버전의 개별 파일 내보내기는 Android에서 지원됩니다.');
       return;
     }
-
-    const target =
-      kind === 'recording'
-        ? selectedRecording.recordingFile
-        : kind === 'transcript'
-          ? selectedRecording.transcriptFile
-          : kind === 'translation'
-            ? selectedRecording.translationFile
-          : selectedRecording.summaryFile;
-
-    if (!target.exists) {
-      setStatusMessage(`${kind} 파일이 아직 없습니다.`);
+    if (!selectedRecording) {
+      setStatusMessage('먼저 파일을 선택해주세요.');
+      return;
+    }
+    if (!selectedRecording.recordingFile.exists) {
+      setStatusMessage('내보낼 녹음 파일이 없습니다.');
       return;
     }
 
     try {
-      const available = await Sharing.isAvailableAsync();
-      if (!available) {
-        Alert.alert('공유 불가', '이 기기에서는 파일 공유를 지원하지 않습니다.');
+      setIsBusy(true);
+      setStatusMessage('개별 파일 내보내기 권한 요청 중...');
+      const permission = await LegacyFileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
+      if (!permission.granted || !permission.directoryUri) {
+        setStatusMessage('내보내기 취소: 저장 위치 권한이 필요합니다.');
         return;
       }
-      await Sharing.shareAsync(target.uri);
-      setStatusMessage(`${kind} 파일 공유창을 열었습니다.`);
+
+      const source = selectedRecording.recordingFile;
+      const targetFileUri = await LegacyFileSystem.StorageAccessFramework.createFileAsync(
+        permission.directoryUri,
+        source.name,
+        guessMimeType(source.name),
+      );
+      const base64 = await LegacyFileSystem.readAsStringAsync(source.uri, {
+        encoding: LegacyFileSystem.EncodingType.Base64,
+      });
+      await LegacyFileSystem.writeAsStringAsync(targetFileUri, base64, {
+        encoding: LegacyFileSystem.EncodingType.Base64,
+      });
+
+      setStatusMessage(`개별 파일 내보내기 완료: ${source.name}`);
+      Alert.alert('내보내기 완료', `${source.name} 파일을 내 파일로 복사했습니다.`);
     } catch (error) {
-      setStatusMessage(`파일 공유 실패: ${formatError(error)}`);
+      setStatusMessage(`개별 파일 내보내기 실패: ${formatError(error)}`);
+    } finally {
+      setIsBusy(false);
     }
   };
 
   const loadSubjects = async (preferredId?: string) => {
     ensureSubjectsRoot();
 
-    const entries = SUBJECTS_ROOT.list();
+    const entries = runtimeSubjectsRoot.list();
     const rows: SubjectItem[] = [];
 
     for (const entry of entries) {
@@ -2920,14 +3079,62 @@ export default function App() {
     const summaryValue = picked.summaryFile.exists ? await picked.summaryFile.text() : '';
     setSummary(summaryValue);
   };
+  const toggleSettingsScreen = () => {
+    setFabOpen(false);
+    setScreenMode((prev) => (prev === 'settings' ? 'home' : 'settings'));
+  };
 
   return (
-    <LinearGradient colors={['#F7F9FC', '#EAF1FB', '#DCE9FF']} style={styles.background}>
+    <LinearGradient colors={workspaceTheme.background as any} style={styles.background}>
       <SafeAreaView style={styles.safeArea}>
         <ScrollView contentContainerStyle={styles.content}>
-          <Text style={styles.title}>Campus Lecture Binder</Text>
-          <Text style={styles.subtitle}>폴더 → 파일 → 전사/번역/요약 상세</Text>
-          <View style={styles.globalStatusCard}>
+          <View style={styles.headerRow}>
+            <Text style={[styles.title, { color: workspaceTheme.title }]}>{WORKSPACE_LABELS[activeWorkspace]}</Text>
+            <Pressable
+              style={[
+                styles.menuButton,
+                { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+              ]}
+              onPress={toggleSettingsScreen}
+            >
+              <Text style={[styles.menuButtonText, { color: workspaceTheme.softButtonText }]}>☰</Text>
+            </Pressable>
+          </View>
+          <Text style={[styles.subtitle, { color: workspaceTheme.subtitle }]}>폴더 → 파일 → 전사/번역/요약 상세</Text>
+          <View style={styles.toggleRow}>
+            <Pressable
+              style={[
+                styles.toggleButton,
+                activeWorkspace === 'university' && styles.toggleButtonActive,
+                activeWorkspace === 'university' && {
+                  borderColor: workspaceTheme.softButtonBorder,
+                  backgroundColor: workspaceTheme.softButtonBg,
+                },
+              ]}
+              onPress={() => setActiveWorkspace('university')}
+            >
+              <Text style={styles.toggleText}>대학교 수업 강의 요약</Text>
+            </Pressable>
+            <Pressable
+              style={[
+                styles.toggleButton,
+                activeWorkspace === 'church' && styles.toggleButtonActive,
+                activeWorkspace === 'church' && {
+                  borderColor: workspaceTheme.softButtonBorder,
+                  backgroundColor: workspaceTheme.softButtonBg,
+                },
+              ]}
+              onPress={() => setActiveWorkspace('church')}
+            >
+              <Text style={styles.toggleText}>교회 설교 요약</Text>
+            </Pressable>
+          </View>
+          <View
+            style={[
+              styles.globalStatusCard,
+              { borderColor: workspaceTheme.accentBorder, backgroundColor: workspaceTheme.accentSurface },
+            ]}
+          >
             <Text style={styles.status}>상태: {statusMessage}</Text>
             {pendingJobs.length > 0 ? (
               <Text style={styles.pendingInfo}>
@@ -2938,92 +3145,9 @@ export default function App() {
           </View>
 
           {screenMode === 'home' ? (
-            <View style={styles.card}>
-              <Text style={styles.sectionTitle}>폴더 목록</Text>
+            <View style={[styles.card, { borderColor: workspaceTheme.cardBorder, backgroundColor: workspaceTheme.cardBg }]}>
+              <Text style={[styles.sectionTitle, { color: workspaceTheme.sectionTitle }]}>폴더 목록</Text>
               <Text style={styles.helper}>아래 폴더 박스를 누르면 내부 녹음 파일 목록이 열립니다.</Text>
-              <View style={styles.authRow}>
-                <Text style={styles.authText}>
-                  {authUser ? `계정: ${authUser.display_name} (${authUser.email})` : '계정: 로그인 필요'}
-                </Text>
-                {authUser ? (
-                  <Pressable style={styles.authButton} onPress={logoutAuth}>
-                    <Text style={styles.authButtonText}>로그아웃</Text>
-                  </Pressable>
-                ) : (
-                  <Pressable
-                    style={styles.authButton}
-                    onPress={() => {
-                      setAuthMode('login');
-                      setAuthModalVisible(true);
-                    }}
-                  >
-                    <Text style={styles.authButtonText}>로그인</Text>
-                  </Pressable>
-                )}
-              </View>
-              <View style={styles.cloudSyncRow}>
-                <Pressable
-                  style={[styles.cloudSyncButton, isBusy && styles.disabledButton]}
-                  onPress={uploadAllFoldersToCloud}
-                  disabled={isBusy}
-                >
-                  <View style={styles.cloudSyncContent}>
-                    <Text style={styles.cloudSyncButtonText}>
-                      {cloudSyncBusy === 'upload' ? '서버 업로드 중...' : '서버 업로드'}
-                    </Text>
-                    {cloudSyncBusy === 'upload' ? (
-                      <ActivityIndicator size="small" color="#1E3A8A" style={styles.cloudSyncSpinner} />
-                    ) : null}
-                  </View>
-                </Pressable>
-                <Pressable
-                  style={[styles.cloudSyncButton, isBusy && styles.disabledButton]}
-                  onPress={restoreAllFoldersFromCloud}
-                  disabled={isBusy}
-                >
-                  <View style={styles.cloudSyncContent}>
-                    <Text style={styles.cloudSyncButtonText}>
-                      {cloudSyncBusy === 'restore' ? '복원 중...' : '서버에서 복원'}
-                    </Text>
-                    {cloudSyncBusy === 'restore' ? (
-                      <ActivityIndicator size="small" color="#1E3A8A" style={styles.cloudSyncSpinner} />
-                    ) : null}
-                  </View>
-                </Pressable>
-              </View>
-              <Pressable
-                style={[styles.cloudArchiveButton, isBusy && styles.disabledButton]}
-                onPress={exportAllLocalFiles}
-                disabled={isBusy}
-              >
-                <Text style={styles.cloudArchiveButtonText}>로컬 파일 내보내기 (내 파일)</Text>
-              </Pressable>
-              {cloudRootDir ? (
-                <View style={styles.cloudLocationRow}>
-                  <Text style={styles.cloudLocationText}>저장 백엔드: {cloudStorageModeLabel(cloudRootDir)}</Text>
-                  <Text style={styles.cloudLocationText}>클라우드 위치: {cloudRootDir}</Text>
-                  {toDriveWebUrl(cloudRootDir) ? (
-                    <Pressable
-                      style={styles.cloudLocationButton}
-                      onPress={() => {
-                        const target = toDriveWebUrl(cloudRootDir);
-                        if (target) {
-                          void Linking.openURL(target);
-                        }
-                      }}
-                    >
-                      <Text style={styles.cloudLocationButtonText}>드라이브 열기</Text>
-                    </Pressable>
-                  ) : null}
-                </View>
-              ) : null}
-              <Pressable
-                style={[styles.cloudArchiveButton, isBusy && styles.disabledButton]}
-                onPress={archiveAndClearCloudLibrary}
-                disabled={isBusy}
-              >
-                <Text style={styles.cloudArchiveButtonText}>클라우드 비우기 (백업 이동)</Text>
-              </Pressable>
               <View style={styles.subjectList}>
                 {subjects.length === 0 ? <Text style={styles.helper}>저장된 폴더가 없습니다.</Text> : null}
                 {subjects.map((subject) => (
@@ -3077,6 +3201,13 @@ export default function App() {
                         <Text style={styles.subjectActionText}>수정</Text>
                       </Pressable>
                       <Pressable
+                        style={[styles.subjectActionButton, isBusy && styles.disabledButton]}
+                        disabled={isBusy}
+                        onPress={() => openMoveSubjectWorkspaceModal(subject)}
+                      >
+                        <Text style={styles.subjectActionText}>폴더 이동</Text>
+                      </Pressable>
+                      <Pressable
                         style={[styles.subjectActionButton, styles.subjectDeleteAction, isBusy && styles.disabledButton]}
                         disabled={isBusy}
                         onPress={() => void deleteSubject(subject)}
@@ -3090,13 +3221,153 @@ export default function App() {
             </View>
           ) : null}
 
-          {screenMode === 'subject' ? (
-            <View style={styles.card}>
+          {screenMode === 'settings' ? (
+            <View style={[styles.card, { borderColor: workspaceTheme.cardBorder, backgroundColor: workspaceTheme.cardBg }]}>
               <View style={styles.topRow}>
-                <Pressable style={styles.openButton} onPress={() => setScreenMode('home')}>
-                  <Text style={styles.openButtonText}>홈으로</Text>
+                <Text style={[styles.sectionTitleInline, { color: workspaceTheme.sectionTitle }]}>설정</Text>
+                <Pressable
+                  style={[
+                    styles.openButton,
+                    { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                  ]}
+                  onPress={() => setScreenMode('home')}
+                >
+                  <Text style={[styles.openButtonText, { color: workspaceTheme.softButtonText }]}>홈으로</Text>
                 </Pressable>
-                <Text style={styles.sectionTitleInline}>폴더: {selectedSubject?.name ?? '없음'}</Text>
+              </View>
+              <Text style={styles.helper}>대학교/교회 공통 설정입니다.</Text>
+              <View style={styles.authRow}>
+                <Text style={styles.authText}>
+                  {authUser ? `계정: ${authUser.display_name} (${authUser.email})` : '계정: 로그인 필요'}
+                </Text>
+                {authUser ? (
+                  <Pressable
+                    style={[
+                      styles.authButton,
+                      { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                    ]}
+                    onPress={logoutAuth}
+                  >
+                    <Text style={[styles.authButtonText, { color: workspaceTheme.softButtonText }]}>로그아웃</Text>
+                  </Pressable>
+                ) : (
+                  <Pressable
+                    style={[
+                      styles.authButton,
+                      { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                    ]}
+                    onPress={() => {
+                      setAuthMode('login');
+                      setAuthModalVisible(true);
+                    }}
+                  >
+                    <Text style={[styles.authButtonText, { color: workspaceTheme.softButtonText }]}>로그인</Text>
+                  </Pressable>
+                )}
+              </View>
+              <View style={styles.cloudSyncRow}>
+                <Pressable
+                  style={[
+                    styles.cloudSyncButton,
+                    { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                    isBusy && styles.disabledButton,
+                  ]}
+                  onPress={uploadAllFoldersToCloud}
+                  disabled={isBusy}
+                >
+                  <View style={styles.cloudSyncContent}>
+                    <Text style={[styles.cloudSyncButtonText, { color: workspaceTheme.softButtonText }]}>
+                      {cloudSyncBusy === 'upload' ? '서버 업로드 중...' : '서버 업로드'}
+                    </Text>
+                    {cloudSyncBusy === 'upload' ? (
+                      <ActivityIndicator size="small" color="#1E3A8A" style={styles.cloudSyncSpinner} />
+                    ) : null}
+                  </View>
+                </Pressable>
+                <Pressable
+                  style={[
+                    styles.cloudSyncButton,
+                    { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                    isBusy && styles.disabledButton,
+                  ]}
+                  onPress={restoreAllFoldersFromCloud}
+                  disabled={isBusy}
+                >
+                  <View style={styles.cloudSyncContent}>
+                    <Text style={[styles.cloudSyncButtonText, { color: workspaceTheme.softButtonText }]}>
+                      {cloudSyncBusy === 'restore' ? '복원 중...' : '서버에서 복원'}
+                    </Text>
+                    {cloudSyncBusy === 'restore' ? (
+                      <ActivityIndicator size="small" color="#1E3A8A" style={styles.cloudSyncSpinner} />
+                    ) : null}
+                  </View>
+                </Pressable>
+              </View>
+              <Pressable
+                style={[styles.cloudArchiveButton, isBusy && styles.disabledButton]}
+                onPress={exportAllLocalFiles}
+                disabled={isBusy}
+              >
+                <Text style={styles.cloudArchiveButtonText}>로컬 파일 내보내기 (내 파일)</Text>
+              </Pressable>
+              {cloudRootDir ? (
+                <View
+                  style={[
+                    styles.cloudLocationRow,
+                    { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                  ]}
+                >
+                  <Text style={[styles.cloudLocationText, { color: workspaceTheme.softButtonText }]}>
+                    저장 백엔드: {cloudStorageModeLabel(cloudRootDir)}
+                  </Text>
+                  <Text style={[styles.cloudLocationText, { color: workspaceTheme.softButtonText }]}>
+                    클라우드 위치: {cloudRootDir}
+                  </Text>
+                  {toDriveWebUrl(cloudRootDir) ? (
+                    <Pressable
+                      style={[
+                        styles.cloudLocationButton,
+                        { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                      ]}
+                      onPress={() => {
+                        const target = toDriveWebUrl(cloudRootDir);
+                        if (target) {
+                          void Linking.openURL(target);
+                        }
+                      }}
+                    >
+                      <Text style={[styles.cloudLocationButtonText, { color: workspaceTheme.softButtonText }]}>
+                        드라이브 열기
+                      </Text>
+                    </Pressable>
+                  ) : null}
+                </View>
+              ) : null}
+              <Pressable
+                style={[styles.cloudArchiveButton, isBusy && styles.disabledButton]}
+                onPress={archiveAndClearCloudLibrary}
+                disabled={isBusy}
+              >
+                <Text style={styles.cloudArchiveButtonText}>클라우드 비우기 (백업 이동)</Text>
+              </Pressable>
+            </View>
+          ) : null}
+
+          {screenMode === 'subject' ? (
+            <View style={[styles.card, { borderColor: workspaceTheme.cardBorder, backgroundColor: workspaceTheme.cardBg }]}>
+              <View style={styles.topRow}>
+                <Pressable
+                  style={[
+                    styles.openButton,
+                    { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                  ]}
+                  onPress={() => setScreenMode('home')}
+                >
+                  <Text style={[styles.openButtonText, { color: workspaceTheme.softButtonText }]}>홈으로</Text>
+                </Pressable>
+                <Text style={[styles.sectionTitleInline, { color: workspaceTheme.sectionTitle }]}>
+                  폴더: {selectedSubject?.name ?? '없음'}
+                </Text>
               </View>
               <Text style={styles.helper}>파일 박스를 누르면 상세 창이 열립니다.</Text>
               <View style={styles.recordingList}>
@@ -3112,25 +3383,39 @@ export default function App() {
                     </Pressable>
                     <View style={styles.recordingActionRow}>
                       <Pressable
-                        style={[styles.recordingMoveButton, (isBusy || index === 0) && styles.disabledButton]}
+                        style={[
+                          styles.recordingMoveButton,
+                          { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                          (isBusy || index === 0) && styles.disabledButton,
+                        ]}
                         onPress={() => void moveRecordingOrder(item.id, 'up')}
                         disabled={isBusy || index === 0}
                       >
-                        <Text style={styles.recordingMoveButtonText}>위</Text>
+                        <Text style={[styles.recordingMoveButtonText, { color: workspaceTheme.softButtonText }]}>위</Text>
                       </Pressable>
                       <Pressable
-                        style={[styles.recordingMoveButton, (isBusy || index === recordings.length - 1) && styles.disabledButton]}
+                        style={[
+                          styles.recordingMoveButton,
+                          { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                          (isBusy || index === recordings.length - 1) && styles.disabledButton,
+                        ]}
                         onPress={() => void moveRecordingOrder(item.id, 'down')}
                         disabled={isBusy || index === recordings.length - 1}
                       >
-                        <Text style={styles.recordingMoveButtonText}>아래</Text>
+                        <Text style={[styles.recordingMoveButtonText, { color: workspaceTheme.softButtonText }]}>아래</Text>
                       </Pressable>
                       <Pressable
-                        style={[styles.recordingMoveButton, isBusy && styles.disabledButton]}
+                        style={[
+                          styles.recordingMoveButton,
+                          { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                          isBusy && styles.disabledButton,
+                        ]}
                         onPress={() => openMoveRecordingModal(item)}
                         disabled={isBusy}
                       >
-                        <Text style={styles.recordingMoveButtonText}>폴더 이동</Text>
+                        <Text style={[styles.recordingMoveButtonText, { color: workspaceTheme.softButtonText }]}>
+                          폴더 이동
+                        </Text>
                       </Pressable>
                     </View>
                   </View>
@@ -3140,12 +3425,18 @@ export default function App() {
           ) : null}
 
           {screenMode === 'record' ? (
-            <View style={styles.card}>
+            <View style={[styles.card, { borderColor: workspaceTheme.cardBorder, backgroundColor: workspaceTheme.cardBg }]}>
               <View style={styles.topRow}>
-                <Pressable style={styles.openButton} onPress={() => setScreenMode('home')}>
-                  <Text style={styles.openButtonText}>홈으로</Text>
+                <Pressable
+                  style={[
+                    styles.openButton,
+                    { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                  ]}
+                  onPress={() => setScreenMode('home')}
+                >
+                  <Text style={[styles.openButtonText, { color: workspaceTheme.softButtonText }]}>홈으로</Text>
                 </Pressable>
-                <Text style={styles.sectionTitleInline}>새 녹음</Text>
+                <Text style={[styles.sectionTitleInline, { color: workspaceTheme.sectionTitle }]}>새 녹음</Text>
               </View>
               <Text style={styles.recordTimer}>{displayTime}</Text>
               <Text style={styles.helper}>
@@ -3153,11 +3444,11 @@ export default function App() {
               </Text>
               {!isRecording ? (
                 <Pressable
-                  style={[styles.actionButton, recordActionBusy && styles.disabledButton]}
+                  style={[styles.actionButton, { backgroundColor: workspaceTheme.strongButtonBg }, recordActionBusy && styles.disabledButton]}
                   onPress={startRecording}
                   disabled={recordActionBusy}
                 >
-                  <Text style={styles.actionButtonText}>녹음 시작</Text>
+                  <Text style={[styles.actionButtonText, { color: workspaceTheme.strongButtonText }]}>녹음 시작</Text>
                 </Pressable>
               ) : (
                 <Pressable
@@ -3176,57 +3467,80 @@ export default function App() {
 
           {screenMode === 'detail' ? (
             <>
-              <View style={styles.card}>
+              <View style={[styles.card, { borderColor: workspaceTheme.cardBorder, backgroundColor: workspaceTheme.cardBg }]}>
                 <View style={styles.topRow}>
-                  <Pressable style={styles.openButton} onPress={() => setScreenMode('subject')}>
-                    <Text style={styles.openButtonText}>파일 목록</Text>
+                  <Pressable
+                    style={[
+                      styles.openButton,
+                      { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                    ]}
+                    onPress={() => setScreenMode('subject')}
+                  >
+                    <Text style={[styles.openButtonText, { color: workspaceTheme.softButtonText }]}>파일 목록</Text>
                   </Pressable>
-                  <Text style={styles.sectionTitleInline}>상세: {selectedRecording?.title ?? '없음'}</Text>
+                  <Text style={[styles.sectionTitleInline, { color: workspaceTheme.sectionTitle }]}>
+                    상세: {selectedRecording?.title ?? '없음'}
+                  </Text>
                 </View>
                 <Text style={styles.helper}>선택 파일 크기: {formatBytes(selectedRecording?.recordingFile.size ?? 0)}</Text>
                 <Text style={styles.filePath} numberOfLines={1}>
                   녹음 파일: {recordingUri ?? '없음'}
                 </Text>
                 <Pressable
-                  style={[styles.renameButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                  style={[
+                    styles.renameButton,
+                    { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                    (!selectedRecording || isBusy) && styles.disabledButton,
+                  ]}
                   onPress={openRenameModal}
                   disabled={!selectedRecording || isBusy}
                 >
-                  <Text style={styles.renameButtonText}>파일 이름 변경</Text>
+                  <Text style={[styles.renameButtonText, { color: workspaceTheme.softButtonText }]}>파일 이름 변경</Text>
                 </Pressable>
               </View>
 
-              <View style={styles.card}>
-                <Text style={styles.sectionTitle}>전사 방식 선택</Text>
+              <View style={[styles.card, { borderColor: workspaceTheme.cardBorder, backgroundColor: workspaceTheme.cardBg }]}>
+                <Text style={[styles.sectionTitle, { color: workspaceTheme.sectionTitle }]}>전사 방식 선택</Text>
                 <ModeToggle mode={transcribeMode} onChange={setTranscribeMode} />
                 {transcribeMode === 'chat' ? (
                   <Pressable
-                    style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                    style={[
+                      styles.actionButton,
+                      { backgroundColor: workspaceTheme.strongButtonBg },
+                      (!selectedRecording || isBusy) && styles.disabledButton,
+                    ]}
                     onPress={runTranscriptionChatApi}
                     disabled={!selectedRecording || isBusy}
                   >
-                    <Text style={styles.actionButtonText}>대화형 AI 전사 실행</Text>
+                    <Text style={[styles.actionButtonText, { color: workspaceTheme.strongButtonText }]}>대화형 AI 전사 실행</Text>
                   </Pressable>
                 ) : (
                   <Pressable
-                    style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                    style={[
+                      styles.actionButton,
+                      { backgroundColor: workspaceTheme.strongButtonBg },
+                      (!selectedRecording || isBusy) && styles.disabledButton,
+                    ]}
                     onPress={runTranscriptionApi}
                     disabled={!selectedRecording || isBusy}
                   >
-                    <Text style={styles.actionButtonText}>API 전사 실행</Text>
+                    <Text style={[styles.actionButtonText, { color: workspaceTheme.strongButtonText }]}>API 전사 실행</Text>
                   </Pressable>
                 )}
                 <View style={styles.previewRow}>
                   <Text style={styles.previewTitle}>전사 내용 (최대 10줄)</Text>
-                  <Pressable style={styles.editChip} onPress={openTranscriptEditor}>
-                    <Text style={styles.editChipText}>+</Text>
+                  <Pressable
+                    style={[styles.editChip, { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg }]}
+                    onPress={openTranscriptEditor}
+                  >
+                    <Text style={[styles.editChipText, { color: workspaceTheme.softButtonText }]}>+</Text>
                   </Pressable>
                 </View>
                 <Text style={styles.bodyText}>{toTenLinePreview(transcript, '전사 결과 없음')}</Text>
               </View>
 
-              <View style={styles.card}>
-                <Text style={styles.sectionTitle}>번역 방식 선택</Text>
+              <View style={[styles.card, { borderColor: workspaceTheme.cardBorder, backgroundColor: workspaceTheme.cardBg }]}>
+                <Text style={[styles.sectionTitle, { color: workspaceTheme.sectionTitle }]}>번역 방식 선택</Text>
                 <ModeToggle mode={translationMode} onChange={setTranslationMode} />
                 <View style={styles.toggleRow}>
                   <Pressable
@@ -3244,68 +3558,103 @@ export default function App() {
                 </View>
                 {translationMode === 'chat' ? (
                   <Pressable
-                    style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                    style={[
+                      styles.actionButton,
+                      { backgroundColor: workspaceTheme.strongButtonBg },
+                      (!selectedRecording || isBusy) && styles.disabledButton,
+                    ]}
                     onPress={runTranslateChatApi}
                     disabled={!selectedRecording || isBusy}
                   >
-                    <Text style={styles.actionButtonText}>대화형 AI 번역 실행</Text>
+                    <Text style={[styles.actionButtonText, { color: workspaceTheme.strongButtonText }]}>대화형 AI 번역 실행</Text>
                   </Pressable>
                 ) : (
                   <Pressable
-                    style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                    style={[
+                      styles.actionButton,
+                      { backgroundColor: workspaceTheme.strongButtonBg },
+                      (!selectedRecording || isBusy) && styles.disabledButton,
+                    ]}
                     onPress={runTranslateApi}
                     disabled={!selectedRecording || isBusy}
                   >
-                    <Text style={styles.actionButtonText}>API 번역 실행</Text>
+                    <Text style={[styles.actionButtonText, { color: workspaceTheme.strongButtonText }]}>API 번역 실행</Text>
                   </Pressable>
                 )}
                 <View style={styles.previewRow}>
                   <Text style={styles.previewTitle}>번역 내용 (최대 10줄)</Text>
-                  <Pressable style={styles.editChip} onPress={openTranslationEditor}>
-                    <Text style={styles.editChipText}>+</Text>
+                  <Pressable
+                    style={[styles.editChip, { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg }]}
+                    onPress={openTranslationEditor}
+                  >
+                    <Text style={[styles.editChipText, { color: workspaceTheme.softButtonText }]}>+</Text>
                   </Pressable>
                 </View>
                 <Text style={styles.bodyText}>{toTenLinePreview(translation, '번역 결과 없음')}</Text>
               </View>
 
-              <View style={styles.card}>
-                <Text style={styles.sectionTitle}>요약 방식 선택</Text>
+              <View style={[styles.card, { borderColor: workspaceTheme.cardBorder, backgroundColor: workspaceTheme.cardBg }]}>
+                <Text style={[styles.sectionTitle, { color: workspaceTheme.sectionTitle }]}>요약 방식 선택</Text>
                 <ModeToggle mode={summaryMode} onChange={setSummaryMode} />
                 {summaryMode === 'chat' ? (
                   <Pressable
-                    style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                    style={[
+                      styles.actionButton,
+                      { backgroundColor: workspaceTheme.strongButtonBg },
+                      (!selectedRecording || isBusy) && styles.disabledButton,
+                    ]}
                     onPress={runSummaryChatApi}
                     disabled={!selectedRecording || isBusy}
                   >
-                    <Text style={styles.actionButtonText}>대화형 AI 요약 실행</Text>
+                    <Text style={[styles.actionButtonText, { color: workspaceTheme.strongButtonText }]}>대화형 AI 요약 실행</Text>
                   </Pressable>
                 ) : (
                   <Pressable
-                    style={[styles.actionButton, (!selectedRecording || isBusy) && styles.disabledButton]}
+                    style={[
+                      styles.actionButton,
+                      { backgroundColor: workspaceTheme.strongButtonBg },
+                      (!selectedRecording || isBusy) && styles.disabledButton,
+                    ]}
                     onPress={runSummaryApi}
                     disabled={!selectedRecording || isBusy}
                   >
-                    <Text style={styles.actionButtonText}>API 요약 실행</Text>
+                    <Text style={[styles.actionButtonText, { color: workspaceTheme.strongButtonText }]}>API 요약 실행</Text>
                   </Pressable>
                 )}
                 <View style={styles.previewRow}>
                   <Text style={styles.previewTitle}>요약 내용 (최대 10줄)</Text>
-                  <Pressable style={styles.editChip} onPress={openSummaryEditor}>
-                    <Text style={styles.editChipText}>+</Text>
+                  <Pressable
+                    style={[styles.editChip, { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg }]}
+                    onPress={openSummaryEditor}
+                  >
+                    <Text style={[styles.editChipText, { color: workspaceTheme.softButtonText }]}>+</Text>
                   </Pressable>
                 </View>
                 <Text style={styles.bodyText}>{toTenLinePreview(summary, '요약 결과 없음')}</Text>
               </View>
 
-              <View style={styles.card}>
+              <View style={[styles.card, { borderColor: workspaceTheme.cardBorder, backgroundColor: workspaceTheme.cardBg }]}>
                 <Text style={styles.status}>상태: {statusMessage}</Text>
-                <Text style={styles.apiInfo}>API: {apiBaseUrl}</Text>
+                <Text style={[styles.apiInfo, { color: workspaceTheme.sectionTitle }]}>API: {apiBaseUrl}</Text>
                 {pendingJobs.length > 0 ? (
                   <Text style={styles.pendingInfo}>
                     진행중 잡: {pendingJobs.map((job) => `${job.fileName} ${jobActionText(job.jobType)}`).join(', ')}
                   </Text>
                 ) : null}
                 {isBusy ? <ActivityIndicator color="#2563EB" style={styles.loader} /> : null}
+                <Pressable
+                  style={[
+                    styles.exportSingleButton,
+                    { borderColor: workspaceTheme.softButtonBorder, backgroundColor: workspaceTheme.softButtonBg },
+                    (!selectedRecording || isBusy) && styles.disabledButton,
+                  ]}
+                  onPress={() => void exportCurrentRecordingToLocal()}
+                  disabled={!selectedRecording || isBusy}
+                >
+                  <Text style={[styles.exportSingleButtonText, { color: workspaceTheme.softButtonText }]}>
+                    로컬로 내보내기
+                  </Text>
+                </Pressable>
                 <Pressable
                   style={[styles.deleteButton, (!selectedRecording || isBusy) && styles.disabledButton]}
                   onPress={deleteCurrentRecording}
@@ -3693,6 +4042,51 @@ export default function App() {
         </View>
       </Modal>
 
+      <Modal
+        visible={subjectMoveModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={closeMoveSubjectWorkspaceModal}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>폴더 이동</Text>
+            <Text style={styles.helper}>폴더 전체를 다른 영역으로 이동합니다.</Text>
+            <View style={styles.toggleRow}>
+              <Pressable
+                style={[styles.toggleButton, subjectMoveTargetWorkspace === 'university' && styles.toggleButtonActive]}
+                onPress={() => setSubjectMoveTargetWorkspace('university')}
+              >
+                <Text style={styles.toggleText}>대학교</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.toggleButton, subjectMoveTargetWorkspace === 'church' && styles.toggleButtonActive]}
+                onPress={() => setSubjectMoveTargetWorkspace('church')}
+              >
+                <Text style={styles.toggleText}>교회</Text>
+              </Pressable>
+            </View>
+            <Text style={styles.helper}>대상: {WORKSPACE_LABELS[subjectMoveTargetWorkspace]}</Text>
+            <View style={styles.modalActions}>
+              <Pressable style={[styles.modalButton, styles.modalCancel]} onPress={closeMoveSubjectWorkspaceModal}>
+                <Text style={styles.modalButtonText}>취소</Text>
+              </Pressable>
+              <Pressable
+                style={[
+                  styles.modalButton,
+                  styles.modalSave,
+                  (isBusy || subjectMoveTargetWorkspace === activeWorkspace) && styles.disabledButton,
+                ]}
+                onPress={() => void moveSubjectToWorkspace()}
+                disabled={isBusy || subjectMoveTargetWorkspace === activeWorkspace}
+              >
+                <Text style={styles.modalButtonText}>이동</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       <Modal visible={uploadModalVisible} transparent animationType="fade" onRequestClose={() => setUploadModalVisible(false)}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
@@ -3796,7 +4190,7 @@ function ModeToggle({ mode, onChange }: ModeToggleProps) {
 }
 
 function getSubjectPaths(subjectId: string): SubjectPaths {
-  const dir = new Directory(SUBJECTS_ROOT, subjectId);
+  const dir = new Directory(runtimeSubjectsRoot, subjectId);
   const recordingsDir = new Directory(dir, 'recordings');
   const transcriptsDir = new Directory(dir, 'transcripts');
   const translationsDir = new Directory(dir, 'translations');
@@ -3951,9 +4345,68 @@ async function readMeta(file: File): Promise<SubjectMeta | null> {
   }
 }
 
-function ensureSubjectsRoot() {
-  if (!SUBJECTS_ROOT.exists) {
-    SUBJECTS_ROOT.create({ idempotent: true, intermediates: true });
+function ensureSubjectsRoot(root?: Directory) {
+  const target = root ?? runtimeSubjectsRoot;
+  if (!target.exists) {
+    target.create({ idempotent: true, intermediates: true });
+  }
+}
+
+function setRuntimeSubjectsRoot(root: Directory) {
+  runtimeSubjectsRoot = root;
+}
+
+function getRuntimeWorkspaceKey(): WorkspaceKey {
+  return runtimeSubjectsRoot.uri === WORKSPACE_SUBJECTS_ROOTS.church.uri ? 'church' : 'university';
+}
+
+async function migrateLegacySubjectsToWorkspace(): Promise<void> {
+  if (!WORKSPACES_ROOT.exists) {
+    WORKSPACES_ROOT.create({ idempotent: true, intermediates: true });
+  }
+  const universityRoot = WORKSPACE_SUBJECTS_ROOTS.university;
+  const churchRoot = WORKSPACE_SUBJECTS_ROOTS.church;
+  if (!universityRoot.exists) {
+    universityRoot.create({ idempotent: true, intermediates: true });
+  }
+  if (!churchRoot.exists) {
+    churchRoot.create({ idempotent: true, intermediates: true });
+  }
+
+  if (!LEGACY_SUBJECTS_ROOT.exists) {
+    return;
+  }
+
+  const legacyEntries = LEGACY_SUBJECTS_ROOT.list();
+  const legacyHasData = legacyEntries.some((entry) => entry instanceof Directory || entry instanceof File);
+  if (!legacyHasData) {
+    return;
+  }
+
+  const universityHasData = universityRoot.list().some((entry) => entry instanceof Directory || entry instanceof File);
+  if (universityHasData) {
+    return;
+  }
+
+  for (const entry of legacyEntries) {
+    if (entry instanceof Directory) {
+      const target = new Directory(universityRoot, entry.name);
+      if (!target.exists) {
+        entry.move(target);
+      }
+      continue;
+    }
+    if (entry instanceof File) {
+      const target = new File(universityRoot, entry.name);
+      if (target.exists) {
+        target.delete();
+      }
+      entry.move(target);
+    }
+  }
+
+  if (LEGACY_SUBJECTS_ROOT.exists && LEGACY_SUBJECTS_ROOT.list().length === 0) {
+    LEGACY_SUBJECTS_ROOT.delete();
   }
 }
 
@@ -4172,7 +4625,7 @@ function collectExportFiles(): ExportFileItem[] {
     }
   };
 
-  walk(SUBJECTS_ROOT, 'subjects');
+  walk(runtimeSubjectsRoot, `workspaces/${getRuntimeWorkspaceKey()}`);
 
   if (PENDING_JOBS_FILE.exists) {
     rows.push({
@@ -4671,6 +5124,7 @@ const styles = StyleSheet.create({
   },
   safeArea: {
     flex: 1,
+    paddingTop: Platform.OS === 'android' ? Math.max(8, Constants.statusBarHeight || 0) : 0,
   },
   content: {
     paddingHorizontal: 16,
@@ -4678,10 +5132,32 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   title: {
+    flex: 1,
     fontSize: 30,
     fontWeight: '800',
     color: '#0F172A',
     letterSpacing: -0.4,
+  },
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  menuButton: {
+    width: 42,
+    height: 42,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#93C5FD',
+    backgroundColor: '#EEF6FF',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  menuButtonText: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#1E3A8A',
+    marginTop: -1,
   },
   subtitle: {
     marginTop: -4,
@@ -5228,6 +5704,20 @@ const styles = StyleSheet.create({
   },
   loader: {
     marginTop: 10,
+  },
+  exportSingleButton: {
+    marginTop: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#93C5FD',
+    backgroundColor: '#EEF6FF',
+    paddingVertical: 10,
+    alignItems: 'center',
+  },
+  exportSingleButtonText: {
+    color: '#1E3A8A',
+    fontSize: 13,
+    fontWeight: '800',
   },
   deleteButton: {
     marginTop: 12,

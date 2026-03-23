@@ -28,7 +28,6 @@
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "usesCleartextTraffic": true,
       "predictiveBackGestureEnabled": false,
       "permissions": [
         "android.permission.RECORD_AUDIO",
@@ -54,7 +53,8 @@
         }
       ],
       "expo-notifications",
-      "expo-sharing"
+      "expo-sharing",
+      "expo-asset"
     ],
     "extra": {
       "eas": {
